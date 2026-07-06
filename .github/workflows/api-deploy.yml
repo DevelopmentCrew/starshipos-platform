@@ -1,8 +1,5 @@
 name: api-deploy
 
-# Manual trigger only, so pushing code never auto-deploys. Pick the environment
-# when you run it (defaults to dev). Builds the API image, pushes to ECR, and
-# rolls the ECS service.
 on:
   workflow_dispatch:
     inputs:
@@ -37,7 +34,7 @@ jobs:
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }} # scopes the OIDC token + optional approval
+    environment: ${{ inputs.environment }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,16 +59,32 @@ jobs:
           docker build -t "$IMAGE" services/api
           docker push "$IMAGE"
 
-          # Swap the image into the current task def and roll the service.
-          TASKDEF=$(aws ecs describe-task-definition --task-definition "$NAME-api" \
-            --query 'taskDefinition' --output json)
-          NEW=$(echo "$TASKDEF" | jq --arg IMG "$IMAGE" '
+          SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$NAME/db-credentials" --query ARN --output text)
+          POOL_ID=$(aws cognito-idp list-user-pools --max-results 60 --query "UserPools[?Name=='$NAME-users'].Id | [0]" --output text)
+          CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$POOL_ID" --query "UserPoolClients[?ClientName=='$NAME-web'].ClientId | [0]" --output text)
+          echo "secret=$SECRET_ARN pool=$POOL_ID client=$CLIENT_ID"
+
+          TASKDEF=$(aws ecs describe-task-definition --task-definition "$NAME-api" --query 'taskDefinition' --output json)
+          NEW=$(echo "$TASKDEF" | jq \
+            --arg IMG "$IMAGE" --arg SECRET "$SECRET_ARN" --arg POOL "$POOL_ID" --arg CLIENT "$CLIENT_ID" '
             .containerDefinitions[0].image = $IMG
+            | .containerDefinitions[0].environment = [
+                {name:"NODE_ENV",value:"production"},
+                {name:"AWS_REGION",value:"eu-west-2"},
+                {name:"COGNITO_USER_POOL_ID",value:$POOL},
+                {name:"COGNITO_APP_CLIENT_ID",value:$CLIENT},
+                {name:"CORS_ORIGIN",value:"*"}
+              ]
+            | .containerDefinitions[0].secrets = [
+                {name:"DB_HOST",valueFrom:($SECRET+":host::")},
+                {name:"DB_PORT",valueFrom:($SECRET+":port::")},
+                {name:"DB_USER",valueFrom:($SECRET+":username::")},
+                {name:"DB_PASSWORD",valueFrom:($SECRET+":password::")},
+                {name:"DB_NAME",valueFrom:($SECRET+":dbname::")}
+              ]
             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
                   .compatibilities, .registeredAt, .registeredBy)')
-          ARN=$(aws ecs register-task-definition --cli-input-json "$NEW" \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
-          aws ecs update-service --cluster "$NAME" --service "$NAME-api" \
-            --task-definition "$ARN" --force-new-deployment
+          ARN=$(aws ecs register-task-definition --cli-input-json "$NEW" --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$NAME" --service "$NAME-api" --task-definition "$ARN" --force-new-deployment
           aws ecs wait services-stable --cluster "$NAME" --services "$NAME-api"
           echo "Deployed $IMAGE to $NAME."

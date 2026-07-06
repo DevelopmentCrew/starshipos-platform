@@ -57,7 +57,7 @@ jobs:
           set -euo pipefail
           IMAGE="$REGISTRY/$NAME-api:$IMAGE_TAG"
           docker build -t "$IMAGE" services/api
-          docker push "$IMAGE"
+          docker push "$IMAGE" || echo "Tag $IMAGE_TAG already in ECR — reusing existing image."
 
           SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$NAME/db-credentials" --query ARN --output text)
           POOL_ID=$(aws cognito-idp list-user-pools --max-results 60 --query "UserPools[?Name=='$NAME-users'].Id | [0]" --output text)

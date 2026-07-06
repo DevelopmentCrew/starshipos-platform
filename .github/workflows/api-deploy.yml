@@ -1,0 +1,77 @@
+name: api-deploy
+
+# Manual trigger only, so pushing code never auto-deploys. Pick the environment
+# when you run it (defaults to dev). Builds the API image, pushes to ECR, and
+# rolls the ECS service.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-2
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: npm run build --if-present
+      - run: npm test --if-present
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }} # scopes the OIDC token + optional approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, push, and deploy
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          NAME: starshipos-${{ inputs.environment }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$NAME-api:$IMAGE_TAG"
+          docker build -t "$IMAGE" services/api
+          docker push "$IMAGE"
+
+          # Swap the image into the current task def and roll the service.
+          TASKDEF=$(aws ecs describe-task-definition --task-definition "$NAME-api" \
+            --query 'taskDefinition' --output json)
+          NEW=$(echo "$TASKDEF" | jq --arg IMG "$IMAGE" '
+            .containerDefinitions[0].image = $IMG
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)')
+          ARN=$(aws ecs register-task-definition --cli-input-json "$NEW" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          aws ecs update-service --cluster "$NAME" --service "$NAME-api" \
+            --task-definition "$ARN" --force-new-deployment
+          aws ecs wait services-stable --cluster "$NAME" --services "$NAME-api"
+          echo "Deployed $IMAGE to $NAME."

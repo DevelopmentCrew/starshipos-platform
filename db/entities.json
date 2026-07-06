@@ -1,0 +1,598 @@
+[
+  {
+    "entity": "ApiToken",
+    "table": "api_token"
+  },
+  {
+    "entity": "AppConfig",
+    "table": "app_config"
+  },
+  {
+    "entity": "AppCounter",
+    "table": "app_counter"
+  },
+  {
+    "entity": "AppMessage",
+    "table": "app_message"
+  },
+  {
+    "entity": "Appliance",
+    "table": "appliance"
+  },
+  {
+    "entity": "ApplianceCategory",
+    "table": "appliance_category"
+  },
+  {
+    "entity": "ApplianceType",
+    "table": "appliance_type"
+  },
+  {
+    "entity": "Assembly",
+    "table": "assembly"
+  },
+  {
+    "entity": "AssemblyLayer",
+    "table": "assembly_layer"
+  },
+  {
+    "entity": "AssetAuditLog",
+    "table": "asset_audit_log"
+  },
+  {
+    "entity": "AssetComment",
+    "table": "asset_comment"
+  },
+  {
+    "entity": "AssetCost",
+    "table": "asset_cost"
+  },
+  {
+    "entity": "BOMItem",
+    "table": "bom_item"
+  },
+  {
+    "entity": "Block",
+    "table": "block"
+  },
+  {
+    "entity": "BudgetAuditLog",
+    "table": "budget_audit_log"
+  },
+  {
+    "entity": "BudgetTransfer",
+    "table": "budget_transfer"
+  },
+  {
+    "entity": "Bug",
+    "table": "bug"
+  },
+  {
+    "entity": "BuildingComponent",
+    "table": "building_component"
+  },
+  {
+    "entity": "CallGroup",
+    "table": "call_group"
+  },
+  {
+    "entity": "CallLog",
+    "table": "call_log"
+  },
+  {
+    "entity": "Category",
+    "table": "category"
+  },
+  {
+    "entity": "Check",
+    "table": "check"
+  },
+  {
+    "entity": "CheckGroup",
+    "table": "check_group"
+  },
+  {
+    "entity": "CheckInstance",
+    "table": "check_instance"
+  },
+  {
+    "entity": "CheckResponse",
+    "table": "check_response"
+  },
+  {
+    "entity": "CheckSheet",
+    "table": "check_sheet"
+  },
+  {
+    "entity": "CheckSheetCategory",
+    "table": "check_sheet_category"
+  },
+  {
+    "entity": "Company",
+    "table": "company"
+  },
+  {
+    "entity": "ComponentDrawing",
+    "table": "component_drawing"
+  },
+  {
+    "entity": "ContingencyItem",
+    "table": "contingency_item"
+  },
+  {
+    "entity": "ContractSumAdjustment",
+    "table": "contract_sum_adjustment"
+  },
+  {
+    "entity": "Country",
+    "table": "country"
+  },
+  {
+    "entity": "CreditNote",
+    "table": "credit_note"
+  },
+  {
+    "entity": "CreditorPaymentSchedule",
+    "table": "creditor_payment_schedule"
+  },
+  {
+    "entity": "CreditorRecord",
+    "table": "creditor_record"
+  },
+  {
+    "entity": "DeliveryJob",
+    "table": "delivery_job"
+  },
+  {
+    "entity": "Department",
+    "table": "department"
+  },
+  {
+    "entity": "DepreciationMethod",
+    "table": "depreciation_method"
+  },
+  {
+    "entity": "Development",
+    "table": "development"
+  },
+  {
+    "entity": "DevelopmentCheckAllocation",
+    "table": "development_check_allocation"
+  },
+  {
+    "entity": "DevelopmentPackage",
+    "table": "development_package"
+  },
+  {
+    "entity": "DevelopmentPrelim",
+    "table": "development_prelim"
+  },
+  {
+    "entity": "DevelopmentProfessionalFee",
+    "table": "development_professional_fee"
+  },
+  {
+    "entity": "Employee",
+    "table": "employee"
+  },
+  {
+    "entity": "EmployeeContract",
+    "table": "employee_contract"
+  },
+  {
+    "entity": "EmployeeDevelopmentHistory",
+    "table": "employee_development_history"
+  },
+  {
+    "entity": "EmployeeNote",
+    "table": "employee_note"
+  },
+  {
+    "entity": "EmployeeSalaryAudit",
+    "table": "employee_salary_audit"
+  },
+  {
+    "entity": "EmployeeSalaryDetails",
+    "table": "employee_salary_details"
+  },
+  {
+    "entity": "EmployersInstruction",
+    "table": "employers_instruction"
+  },
+  {
+    "entity": "Estimate",
+    "table": "estimate"
+  },
+  {
+    "entity": "EstimateLine",
+    "table": "estimate_line"
+  },
+  {
+    "entity": "EstimatingRate",
+    "table": "estimating_rate"
+  },
+  {
+    "entity": "GSDAction",
+    "table": "gsd_action"
+  },
+  {
+    "entity": "GSDActionLog",
+    "table": "gsd_action_log"
+  },
+  {
+    "entity": "GSDCategory",
+    "table": "gsd_category"
+  },
+  {
+    "entity": "GSDLog",
+    "table": "gsd_log"
+  },
+  {
+    "entity": "GlobalPackageCategory",
+    "table": "global_package_category"
+  },
+  {
+    "entity": "HelpArticle",
+    "table": "help_article"
+  },
+  {
+    "entity": "HiredAsset",
+    "table": "hired_asset"
+  },
+  {
+    "entity": "HistoricalTransaction",
+    "table": "historical_transaction"
+  },
+  {
+    "entity": "HouseTypeBOM",
+    "table": "house_type_bom"
+  },
+  {
+    "entity": "IVRRoute",
+    "table": "ivr_route"
+  },
+  {
+    "entity": "InformationRequest",
+    "table": "information_request"
+  },
+  {
+    "entity": "Invitation",
+    "table": "invitation"
+  },
+  {
+    "entity": "J5CheckItem",
+    "table": "j5_check_item"
+  },
+  {
+    "entity": "J5CheckResponse",
+    "table": "j5_check_response"
+  },
+  {
+    "entity": "Job",
+    "table": "job"
+  },
+  {
+    "entity": "JobRole",
+    "table": "job_role"
+  },
+  {
+    "entity": "JobUpdate",
+    "table": "job_update"
+  },
+  {
+    "entity": "KitCategory",
+    "table": "kit_category"
+  },
+  {
+    "entity": "KitSubCategory",
+    "table": "kit_sub_category"
+  },
+  {
+    "entity": "MaintenanceJob",
+    "table": "maintenance_job"
+  },
+  {
+    "entity": "MaintenanceSchedule",
+    "table": "maintenance_schedule"
+  },
+  {
+    "entity": "ManufacturingCell",
+    "table": "manufacturing_cell"
+  },
+  {
+    "entity": "ManufacturingJob",
+    "table": "manufacturing_job"
+  },
+  {
+    "entity": "MaterialCategory",
+    "table": "material_category"
+  },
+  {
+    "entity": "MeasuredWorkMasterItem",
+    "table": "measured_work_master_item"
+  },
+  {
+    "entity": "NCR",
+    "table": "ncr"
+  },
+  {
+    "entity": "NCRCategory",
+    "table": "ncr_category"
+  },
+  {
+    "entity": "NCRComment",
+    "table": "ncr_comment"
+  },
+  {
+    "entity": "Opportunity",
+    "table": "opportunity"
+  },
+  {
+    "entity": "OwnedAsset",
+    "table": "owned_asset"
+  },
+  {
+    "entity": "POAuditLog",
+    "table": "po_audit_log"
+  },
+  {
+    "entity": "POAuthorityLevel",
+    "table": "po_authority_level"
+  },
+  {
+    "entity": "PackageCategory",
+    "table": "package_category"
+  },
+  {
+    "entity": "PaymentPack",
+    "table": "payment_pack"
+  },
+  {
+    "entity": "PaymentPackLineItem",
+    "table": "payment_pack_line_item"
+  },
+  {
+    "entity": "PaymentRun",
+    "table": "payment_run"
+  },
+  {
+    "entity": "PlanRevision",
+    "table": "plan_revision"
+  },
+  {
+    "entity": "Plot",
+    "table": "plot"
+  },
+  {
+    "entity": "PrelimCostItem",
+    "table": "prelim_cost_item"
+  },
+  {
+    "entity": "PrelimCostType",
+    "table": "prelim_cost_type"
+  },
+  {
+    "entity": "PrelimHeading",
+    "table": "prelim_heading"
+  },
+  {
+    "entity": "PricingSetting",
+    "table": "pricing_setting"
+  },
+  {
+    "entity": "Priority",
+    "table": "priority"
+  },
+  {
+    "entity": "ProcurementSchedule",
+    "table": "procurement_schedule"
+  },
+  {
+    "entity": "Product",
+    "table": "product"
+  },
+  {
+    "entity": "ProductCategory",
+    "table": "product_category"
+  },
+  {
+    "entity": "ProfessionalFeeItem",
+    "table": "professional_fee_item"
+  },
+  {
+    "entity": "ProfessionalFeeType",
+    "table": "professional_fee_type"
+  },
+  {
+    "entity": "ProgrammeData",
+    "table": "programme_data"
+  },
+  {
+    "entity": "ProgressUpdate",
+    "table": "progress_update"
+  },
+  {
+    "entity": "Property",
+    "table": "property"
+  },
+  {
+    "entity": "PropertyOwner",
+    "table": "property_owner"
+  },
+  {
+    "entity": "PropertyType",
+    "table": "property_type"
+  },
+  {
+    "entity": "PurchaseInvoice",
+    "table": "purchase_invoice"
+  },
+  {
+    "entity": "PurchaseOrder",
+    "table": "purchase_order"
+  },
+  {
+    "entity": "PurchaseOrderLineItem",
+    "table": "purchase_order_line_item"
+  },
+  {
+    "entity": "QSAccrual",
+    "table": "qs_accrual"
+  },
+  {
+    "entity": "RedTag",
+    "table": "red_tag"
+  },
+  {
+    "entity": "Resident",
+    "table": "resident"
+  },
+  {
+    "entity": "RevenueApplication",
+    "table": "revenue_application"
+  },
+  {
+    "entity": "RevenueApplicationItem",
+    "table": "revenue_application_item"
+  },
+  {
+    "entity": "RiskOpportunity",
+    "table": "risk_opportunity"
+  },
+  {
+    "entity": "SalesHubCategory",
+    "table": "sales_hub_category"
+  },
+  {
+    "entity": "SalesHubMarket",
+    "table": "sales_hub_market"
+  },
+  {
+    "entity": "SalesHubProposalType",
+    "table": "sales_hub_proposal_type"
+  },
+  {
+    "entity": "ServiceCall",
+    "table": "service_call"
+  },
+  {
+    "entity": "Shift",
+    "table": "shift"
+  },
+  {
+    "entity": "SignInRecord",
+    "table": "sign_in_record"
+  },
+  {
+    "entity": "SiteDiaryEntry",
+    "table": "site_diary_entry"
+  },
+  {
+    "entity": "StockAllocation",
+    "table": "stock_allocation"
+  },
+  {
+    "entity": "StockLedger",
+    "table": "stock_ledger"
+  },
+  {
+    "entity": "StockTakeRecord",
+    "table": "stock_take_record"
+  },
+  {
+    "entity": "StockTransaction",
+    "table": "stock_transaction"
+  },
+  {
+    "entity": "SubcontractorApproval",
+    "table": "subcontractor_approval"
+  },
+  {
+    "entity": "SubcontractorCorrespondence",
+    "table": "subcontractor_correspondence"
+  },
+  {
+    "entity": "SubcontractorInsurance",
+    "table": "subcontractor_insurance"
+  },
+  {
+    "entity": "SubcontractorNote",
+    "table": "subcontractor_note"
+  },
+  {
+    "entity": "SubcontractorPrequalification",
+    "table": "subcontractor_prequalification"
+  },
+  {
+    "entity": "Supplier",
+    "table": "supplier"
+  },
+  {
+    "entity": "Timesheet",
+    "table": "timesheet"
+  },
+  {
+    "entity": "TimesheetEntry",
+    "table": "timesheet_entry"
+  },
+  {
+    "entity": "TrainingMatrixRule",
+    "table": "training_matrix_rule"
+  },
+  {
+    "entity": "TrainingModule",
+    "table": "training_module"
+  },
+  {
+    "entity": "TrainingRecord",
+    "table": "training_record"
+  },
+  {
+    "entity": "TrainingSession",
+    "table": "training_session"
+  },
+  {
+    "entity": "UnitOfMeasure",
+    "table": "unit_of_measure"
+  },
+  {
+    "entity": "User",
+    "table": "user"
+  },
+  {
+    "entity": "Visit",
+    "table": "visit"
+  },
+  {
+    "entity": "WorkPackage",
+    "table": "work_package"
+  },
+  {
+    "entity": "XeroAccountCode",
+    "table": "xero_account_code"
+  },
+  {
+    "entity": "XeroConnection",
+    "table": "xero_connection"
+  },
+  {
+    "entity": "XeroInvoice",
+    "table": "xero_invoice"
+  },
+  {
+    "entity": "XeroInvoiceCache",
+    "table": "xero_invoice_cache"
+  },
+  {
+    "entity": "XeroSyncLog",
+    "table": "xero_sync_log"
+  },
+  {
+    "entity": "XeroSyncQueue",
+    "table": "xero_sync_queue"
+  },
+  {
+    "entity": "XeroTaxRate",
+    "table": "xero_tax_rate"
+  }
+]

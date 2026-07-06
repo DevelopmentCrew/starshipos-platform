@@ -1,0 +1,2 @@
+# Schema generation + validation
+pglast>=6.0

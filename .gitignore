@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+*.tfplan
+tfplan-*
+
+# Data export (local migration artifacts, never commit)
+data-export/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+
+# OS
+.DS_Store

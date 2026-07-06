@@ -1,0 +1,16 @@
+{
+  "name": "starshipos-data-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Base44 export, Postgres import, and reconciliation for the StarshipOS migration.",
+  "scripts": {
+    "export": "node export-base44.mjs",
+    "import": "node import-to-postgres.mjs",
+    "reconcile": "node reconcile.mjs"
+  },
+  "dependencies": {
+    "@base44/sdk": "^0.5.0",
+    "pg": "^8.13.1"
+  }
+}

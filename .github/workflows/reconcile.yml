@@ -1,0 +1,47 @@
+name: reconcile
+
+# Export every Base44 entity and produce a reconciliation manifest
+# (per-table row counts + checksums). Runs on demand and nightly during the
+# migration dress-rehearsal period. Regenerating schema.sql from the fresh
+# snapshot is a separate manual review step (see Makefile: `make schema`).
+
+# Manual only for now. Base44 export needs a bearer token (BASE44_TOKEN secret)
+# because the admin account is SSO; tokens expire (~90 days), so a nightly
+# schedule would break — re-enable a schedule once we have a refreshable token.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export-and-reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install SDK
+        run: npm install @base44/sdk
+
+      - name: Export all entities from Base44
+        env:
+          BASE44_APP_ID: ${{ secrets.BASE44_APP_ID }}
+          BASE44_EMAIL: ${{ secrets.BASE44_EMAIL }}
+          BASE44_PASSWORD: ${{ secrets.BASE44_PASSWORD }}
+        run: node scripts/export-base44.mjs
+
+      - name: Build reconciliation report
+        run: node scripts/reconcile.mjs
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: reconciliation-${{ github.run_id }}
+          path: |
+            data-export/_manifest.json
+            data-export/reconciliation.json
+          retention-days: 14

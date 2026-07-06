@@ -1,0 +1,85 @@
+name: infra
+
+# Manual until OIDC is wired for the new repo; re-add push-on-main later.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC federation to AWS — no long-lived keys
+  contents: read
+  pull-requests: write
+
+env:
+  TF_DIR: infra/terraform
+  AWS_REGION: eu-west-2
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev] # add prod once the prod account is bootstrapped
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform fmt
+        run: terraform -chdir=${{ env.TF_DIR }} fmt -recursive
+
+      - name: Terraform init
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} init \
+            -backend-config="bucket=starshipos-tfstate-${{ matrix.environment }}" \
+            -backend-config="dynamodb_table=starshipos-tflock-${{ matrix.environment }}" \
+            -backend-config="key=starshipos/${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform validate
+        run: terraform -chdir=${{ env.TF_DIR }} validate
+
+      - name: Terraform plan
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} plan \
+            -var-file="environments/${{ matrix.environment }}.tfvars" \
+            -out=tfplan-${{ matrix.environment }}
+
+  apply:
+    # Apply only on merge to main, gated by a protected environment approval.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        environment: [dev] # add prod once the prod account is bootstrapped
+    environment: ${{ matrix.environment }} # requires reviewer approval for prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.5
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Terraform init
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} init \
+            -backend-config="bucket=starshipos-tfstate-${{ matrix.environment }}" \
+            -backend-config="dynamodb_table=starshipos-tflock-${{ matrix.environment }}" \
+            -backend-config="key=starshipos/${{ matrix.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+      - name: Terraform apply
+        run: |
+          terraform -chdir=${{ env.TF_DIR }} apply -auto-approve \
+            -var-file="environments/${{ matrix.environment }}.tfvars"

@@ -3,6 +3,11 @@ name: api-deploy
 # Manual trigger only. Builds the API image, pushes to ECR, injects the DB
 # secret + Cognito config, and rolls the ECS service.
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/api/**'
+      - '.github/workflows/api-deploy.yml'
   workflow_dispatch:
     inputs:
       environment:
@@ -36,7 +41,7 @@ jobs:
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+    environment: ${{ github.event.inputs.environment || 'dev' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +58,7 @@ jobs:
       - name: Build, push, and deploy
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          NAME: starshipos-${{ inputs.environment }}
+          NAME: starshipos-${{ github.event.inputs.environment || 'dev' }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -72,7 +77,7 @@ jobs:
           # File storage: uploads bucket + the app's public origin (used to build
           # durable file_urls). PUBLIC_BASE is the CloudFront domain for this env.
           UPLOADS_BUCKET="$NAME-uploads"
-          if [ "${{ inputs.environment }}" = "prod" ]; then
+          if [ "${{ github.event.inputs.environment || 'dev' }}" = "prod" ]; then
             PUBLIC_BASE="https://os.starshipgroup.co.uk"
           else
             PUBLIC_BASE="https://d1w15g135zlze.cloudfront.net"

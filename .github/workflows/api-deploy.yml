@@ -91,7 +91,8 @@ jobs:
                 {name:"CORS_ORIGIN",value:"*"},
                 {name:"UPLOADS_BUCKET",value:$UPLOADS},
                 {name:"PUBLIC_BASE_URL",value:$PUBLICBASE},
-                {name:"AI_MODEL",value:"claude-sonnet-4-6"}
+                {name:"AI_MODEL",value:"claude-sonnet-4-6"},
+                {name:"EMAIL_FROM",value:"davedargan@starshipgroup.co.uk"}
               ]
             | .containerDefinitions[0].secrets = [
                 {name:"DB_HOST",valueFrom:($SECRET+":host::")},

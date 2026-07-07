@@ -51,6 +51,14 @@ export const config = {
     apiKey: process.env.ANTHROPIC_API_KEY || '',
     secretId: optional('ANTHROPIC_SECRET_ID', 'starshipos-dev/anthropic-api-key'),
   },
+
+  // Email (replaces Base44 SendEmail) via Amazon SES. `from` must be an SES-verified
+  // identity; in the SES sandbox recipients must be verified too until production
+  // access is granted.
+  email: {
+    region: optional('SES_REGION', optional('AWS_REGION', 'eu-west-2')),
+    from: optional('EMAIL_FROM', 'noreply@starshipgroup.co.uk'),
+  },
 } as const;
 
 export function assertRuntimeConfig(): void {

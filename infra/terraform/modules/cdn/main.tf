@@ -14,6 +14,7 @@ variable "root_domain" { type = string }
 variable "frontend_bucket_regional_dn" { type = string }
 variable "frontend_bucket_arn" { type = string }
 variable "frontend_bucket_id" { type = string }
+variable "api_alb_dns_name" { type = string }
 
 # --- Custom-domain path (prod): Route53 zone + ACM cert ---
 data "aws_route53_zone" "root" {
@@ -71,6 +72,18 @@ resource "aws_cloudfront_distribution" "frontend" {
     origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
   }
 
+  # The API load balancer, so /api/* is served over HTTPS on the same domain.
+  origin {
+    domain_name = var.api_alb_dns_name
+    origin_id   = "api-alb"
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
   default_cache_behavior {
     target_origin_id       = "s3-frontend"
     viewer_protocol_policy = "redirect-to-https"
@@ -78,6 +91,16 @@ resource "aws_cloudfront_distribution" "frontend" {
     cached_methods         = ["GET", "HEAD"]
     compress               = true
     cache_policy_id        = "658327ea-f89d-4fab-a63d-7e88639e58f6" # Managed-CachingOptimized
+  }
+
+  ordered_cache_behavior {
+    path_pattern             = "/api/*"
+    target_origin_id         = "api-alb"
+    viewer_protocol_policy   = "redirect-to-https"
+    allowed_methods          = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods           = ["GET", "HEAD"]
+    cache_policy_id          = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # Managed-CachingDisabled
+    origin_request_policy_id = "b689b0a8-53d0-40ab-baf2-68738e2966ac" # Managed-AllViewerExceptHostHeader
   }
 
   custom_error_response {

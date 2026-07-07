@@ -42,6 +42,7 @@ module "cdn" {
   frontend_bucket_regional_dn = module.storage.frontend_bucket_regional_domain_name
   frontend_bucket_arn         = module.storage.frontend_bucket_arn
   frontend_bucket_id          = module.storage.frontend_bucket_id
+  api_alb_dns_name            = module.api.alb_dns_name
 
   providers = {
     aws.us_east_1 = aws.us_east_1

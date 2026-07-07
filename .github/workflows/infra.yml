@@ -54,7 +54,7 @@ jobs:
 
   apply:
     # Apply only on merge to main, gated by a protected environment approval.
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main'
     needs: plan
     runs-on: ubuntu-latest
     strategy:

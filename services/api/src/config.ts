@@ -40,6 +40,17 @@ export const config = {
     uploadsBucket: optional('UPLOADS_BUCKET', ''),
     publicBaseUrl: optional('PUBLIC_BASE_URL', ''),
   },
+
+  // AI (replaces Base44 InvokeLLM / ExtractDataFromUploadedFile) via the Anthropic
+  // API. The key comes from ANTHROPIC_API_KEY, or is read at runtime from Secrets
+  // Manager (secretId) using the task role.
+  ai: {
+    region: optional('AWS_REGION', 'eu-west-2'),
+    model: optional('AI_MODEL', 'claude-sonnet-4-6'),
+    maxTokens: parseInt(optional('AI_MAX_TOKENS', '4096'), 10),
+    apiKey: process.env.ANTHROPIC_API_KEY || '',
+    secretId: optional('ANTHROPIC_SECRET_ID', 'starshipos-dev/anthropic-api-key'),
+  },
 } as const;
 
 export function assertRuntimeConfig(): void {

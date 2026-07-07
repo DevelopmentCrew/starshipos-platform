@@ -59,7 +59,9 @@ jobs:
           set -euo pipefail
           IMAGE="$REGISTRY/$NAME-api:$IMAGE_TAG"
           docker build -t "$IMAGE" services/api
-          docker push "$IMAGE"
+          # ECR tags are immutable: if this exact SHA was already pushed (e.g. a
+          # re-run), the tag exists — that's fine, reuse it and carry on deploying.
+          docker push "$IMAGE" || echo "image tag $IMAGE_TAG already in ECR, reusing it"
 
           # Look up the DB secret and Cognito ids for this environment.
           SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$NAME/db-credentials" --query ARN --output text)

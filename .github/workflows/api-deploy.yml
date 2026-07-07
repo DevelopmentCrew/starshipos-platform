@@ -1,5 +1,7 @@
 name: api-deploy
 
+# Manual trigger only. Builds the API image, pushes to ECR, injects the DB
+# secret + Cognito config, and rolls the ECS service.
 on:
   workflow_dispatch:
     inputs:
@@ -57,8 +59,9 @@ jobs:
           set -euo pipefail
           IMAGE="$REGISTRY/$NAME-api:$IMAGE_TAG"
           docker build -t "$IMAGE" services/api
-          docker push "$IMAGE" || echo "Tag $IMAGE_TAG already in ECR — reusing existing image."
+          docker push "$IMAGE"
 
+          # Look up the DB secret and Cognito ids for this environment.
           SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$NAME/db-credentials" --query ARN --output text)
           POOL_ID=$(aws cognito-idp list-user-pools --max-results 60 --query "UserPools[?Name=='$NAME-users'].Id | [0]" --output text)
           CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$POOL_ID" --query "UserPoolClients[?ClientName=='$NAME-web'].ClientId | [0]" --output text)

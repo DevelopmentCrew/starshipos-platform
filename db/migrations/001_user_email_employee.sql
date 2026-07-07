@@ -1,0 +1,33 @@
+-- Backfill user.email + user.employee_id (dropped by June-baseline schema).
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS email text;
+ALTER TABLE "user" ADD COLUMN IF NOT EXISTS employee_id text;
+CREATE INDEX IF NOT EXISTS idx_user_email_lower ON "user" (lower(email));
+
+UPDATE "user" SET email='davedargan@starshipgroup.co.uk', employee_id='69c2a3bc8cc795eaf843e011', role='admin' WHERE id='698dd71bea4336a2150f8d16';
+UPDATE "user" SET email='dave@davedargan.com', employee_id=NULL, role='user' WHERE id='699e05e88b9d8d858c0481b4';
+UPDATE "user" SET email='dave@thirtyfour.co.uk', employee_id=NULL, role='user' WHERE id='699f225a5dfb98ae1cb8e064';
+UPDATE "user" SET email='mobileuser@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69a6bc391903661eab4f3861';
+UPDATE "user" SET email='j5usercell@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69a80b6f2b96401674bf9996';
+UPDATE "user" SET email='j5usercell2@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69b57d2208c0c9905fb8161a';
+UPDATE "user" SET email='j5builduser@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69b57e54a4125e42ca3ef692';
+UPDATE "user" SET email='j5installationteam@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69b6ab00f2d185b55c88363e';
+UPDATE "user" SET email='billyberesford@starshipgroup.co.uk', employee_id='69c2a3bc8cc795eaf843e00f', role='admin' WHERE id='69bd1f916d1ed9e6dd050f98';
+UPDATE "user" SET email='projecttest@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69c1680cf251c7f3671bf9ff';
+UPDATE "user" SET email='saleshubuser@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69c4350134b90c7c2a80f30c';
+UPDATE "user" SET email='salesuser2@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69c43df7b29a840cd3d30dc1';
+UPDATE "user" SET email='chrismoores@starshipgroup.co.uk', employee_id='69c2a365e8edaf84187ba3cf', role='user' WHERE id='69c448e410feaa4002c421f9';
+UPDATE "user" SET email='simonhumphreys@starshipgroup.co.uk', employee_id='69c2a3bc8cc795eaf843e013', role='user' WHERE id='69c548b7e56547eb74c420d2';
+UPDATE "user" SET email='signinhythe@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69c59f6cb1270946e0212e0c';
+UPDATE "user" SET email='factoryuser@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69ca985e486efcdb12ecd160';
+UPDATE "user" SET email='apple@starshipgroup.co.uk', employee_id=NULL, role='admin' WHERE id='69ccbd9ae5cc4ec6d045050a';
+UPDATE "user" SET email='claremcdermott@starshipgroup.co.uk', employee_id='69c2a3bc8cc795eaf843e010', role='user' WHERE id='69ce8343739f22d075141d0b';
+UPDATE "user" SET email='philiparmitage@starshipgroup.co.uk', employee_id='69c2a365e8edaf84187ba3d3', role='admin' WHERE id='69df6ba2c1e196792d58e2c1';
+UPDATE "user" SET email='leo@starshipcanada.com', employee_id=NULL, role='user' WHERE id='69e77393807dcbf3fd11aab7';
+UPDATE "user" SET email='bencrosse@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='69ef6ab57fd2ef9d5e51a377';
+UPDATE "user" SET email='daverushton@starshipgroup.co.uk', employee_id='69c2a3104cfe7effd6bf81de', role='user' WHERE id='69f9a01ec450d6ab4122925a';
+UPDATE "user" SET email='timmain@starshipgroup.co.uk', employee_id='69c2a365e8edaf84187ba3d6', role='user' WHERE id='69fba5f80290f10f6bb10d87';
+UPDATE "user" SET email='chrisdodd@starshipgroup.co.uk', employee_id='69c2a365e8edaf84187ba3ce', role='admin' WHERE id='69fc461d7e5bde658dcc284d';
+UPDATE "user" SET email='kevinhardy@starshipgroup.co.uk', employee_id='69c2a3bc8cc795eaf843e00c', role='user' WHERE id='6a017f51b2fcae8dd09b530f';
+UPDATE "user" SET email='waynehughes@starshipgroup.co.uk', employee_id='69c2a365e8edaf84187ba3d7', role='user' WHERE id='6a02e69f87bd9835001f1fcc';
+UPDATE "user" SET email='grahamegeary@starshipgroup.co.uk', employee_id='6a3a4860fd8f8aa507746140', role='user' WHERE id='6a1999321d8dd3a3fbfe43ca';
+UPDATE "user" SET email='neilkearns@starshipgroup.co.uk', employee_id=NULL, role='user' WHERE id='6a22a2fd92422914573d9382';

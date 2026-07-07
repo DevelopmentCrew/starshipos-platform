@@ -13,6 +13,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+# Bundled SQL migrations, applied on boot by dist/migrate.js (../migrations).
+COPY migrations ./migrations
 # Run as the non-root user that the base image ships with.
 USER node
 EXPOSE 3000

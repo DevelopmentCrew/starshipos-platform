@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { config, assertRuntimeConfig } from './config.js';
+import { runMigrations } from './migrate.js';
 import { healthRoutes } from './routes/health.js';
 import { entityRoutes } from './routes/entities.js';
 import { fileRoutes } from './routes/files.js';
@@ -26,6 +27,7 @@ export function buildServer() {
 
 async function main() {
   assertRuntimeConfig();
+  await runMigrations();
   const app = buildServer();
   try {
     await app.listen({ port: config.port, host: '0.0.0.0' });

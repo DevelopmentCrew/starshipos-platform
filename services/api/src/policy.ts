@@ -1,12 +1,8 @@
 // Row-level authorization policy.
 //
 // The JWT proves *who* the user is; this module decides *which rows* they may
-// see in a given table, from their profile (role, accessible developments,
-// module access, employee id, customer id) loaded from the `user` table.
-//
-// This is the proper, central RLS we wanted after the Base44 `.data` saga:
-// one place, driven by the actual columns each table has, plus a small set of
-// curated overrides for sensitive and reference data.
+// read/write in a given table, from their profile (role, accessible
+// developments, module access, employee id, customer id).
 import type { AuthUser } from './auth.js';
 
 export interface ScopeResult {
@@ -53,44 +49,74 @@ const MODULE_MAP: Record<string, string> = {
   maintenance_job: 'homecare', maintenance_schedule: 'homecare',
 };
 
-/**
- * Build the WHERE fragment for `table`, given the user and the table's columns.
- * Order matters: admin bypass, then sensitive deny, then module gate, then the
- * column-driven scopes, then reference allow, then deny-by-default.
- */
+/** WHERE fragment for reads on `table`, given the user and the table's columns. */
 export function scopeFor(table: string, user: AuthUser, cols: Set<string>): ScopeResult {
   if (user.role === 'admin') return allow();
-
   if (ADMIN_ONLY.has(table)) return deny();
 
   const mod = MODULE_MAP[table];
   if (mod && !user.moduleAccess?.[mod]) return deny();
 
-  // Development-scoped: the bulk of operational data.
+  // The developments list itself: it has no development_id column (it *is* the
+  // development), so scope on its own id / customer.
+  if (table === 'development') {
+    const parts: string[] = [];
+    const params: unknown[] = [];
+    if (user.accessibleDevelopments?.length) {
+      params.push(user.accessibleDevelopments);
+      parts.push(`"id" = ANY($${params.length})`);
+    }
+    if (user.customerId) {
+      params.push(user.customerId);
+      parts.push(`"customer_id" = $${params.length}`);
+    }
+    return parts.length ? { sql: `WHERE ${parts.join(' OR ')}`, params } : deny();
+  }
+
   if (cols.has('development_id')) {
     if (!user.accessibleDevelopments?.length) return deny();
     return { sql: 'WHERE "development_id" = ANY($1)', params: [user.accessibleDevelopments] };
   }
-
-  // Customer-scoped (e.g. HomeCare resident data).
   if (cols.has('customer_id')) {
     if (!user.customerId) return deny();
     return { sql: 'WHERE "customer_id" = $1', params: [user.customerId] };
   }
-
-  // Employee-linked: your own records, unless you hold the relevant module.
   if (cols.has('employee_id')) {
     if (mod && user.moduleAccess?.[mod]) return allow();
     if (!user.employeeId) return deny();
     return { sql: 'WHERE "employee_id" = $1', params: [user.employeeId] };
   }
-
-  // Passed a module gate with no row-scoping column → the module grants access.
   if (mod) return allow();
-
-  // Reference / lookup data.
   if (REFERENCE.has(table)) return allow();
-
-  // Unclassified → deny by default (safe).
   return deny();
+}
+
+/** May this user CREATE the given row in `table`? */
+export function canWrite(
+  table: string,
+  user: AuthUser,
+  row: Record<string, unknown>,
+  cols: Set<string>,
+): boolean {
+  if (user.role === 'admin') return true;
+  if (ADMIN_ONLY.has(table)) return false;
+
+  const mod = MODULE_MAP[table];
+  if (mod && !user.moduleAccess?.[mod]) return false;
+
+  if (table === 'development') {
+    return !!user.accessibleDevelopments?.includes(String(row.id));
+  }
+  if (cols.has('development_id')) {
+    return !!user.accessibleDevelopments?.includes(String(row.development_id));
+  }
+  if (cols.has('customer_id')) {
+    return !!user.customerId && row.customer_id === user.customerId;
+  }
+  if (cols.has('employee_id')) {
+    if (mod && user.moduleAccess?.[mod]) return true;
+    return row.employee_id === user.employeeId;
+  }
+  // Module holder with no row-scoping column may write; reference/unclassified may not.
+  return !!mod;
 }

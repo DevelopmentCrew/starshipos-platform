@@ -67,16 +67,28 @@ jobs:
           CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id "$POOL_ID" --query "UserPoolClients[?ClientName=='$NAME-web'].ClientId | [0]" --output text)
           echo "secret=$SECRET_ARN pool=$POOL_ID client=$CLIENT_ID"
 
+          # File storage: uploads bucket + the app's public origin (used to build
+          # durable file_urls). PUBLIC_BASE is the CloudFront domain for this env.
+          UPLOADS_BUCKET="$NAME-uploads"
+          if [ "${{ inputs.environment }}" = "prod" ]; then
+            PUBLIC_BASE="https://os.starshipgroup.co.uk"
+          else
+            PUBLIC_BASE="https://d1w15g135zlze.cloudfront.net"
+          fi
+
           TASKDEF=$(aws ecs describe-task-definition --task-definition "$NAME-api" --query 'taskDefinition' --output json)
           NEW=$(echo "$TASKDEF" | jq \
-            --arg IMG "$IMAGE" --arg SECRET "$SECRET_ARN" --arg POOL "$POOL_ID" --arg CLIENT "$CLIENT_ID" '
+            --arg IMG "$IMAGE" --arg SECRET "$SECRET_ARN" --arg POOL "$POOL_ID" --arg CLIENT "$CLIENT_ID" \
+            --arg UPLOADS "$UPLOADS_BUCKET" --arg PUBLICBASE "$PUBLIC_BASE" '
             .containerDefinitions[0].image = $IMG
             | .containerDefinitions[0].environment = [
                 {name:"NODE_ENV",value:"production"},
                 {name:"AWS_REGION",value:"eu-west-2"},
                 {name:"COGNITO_USER_POOL_ID",value:$POOL},
                 {name:"COGNITO_APP_CLIENT_ID",value:$CLIENT},
-                {name:"CORS_ORIGIN",value:"*"}
+                {name:"CORS_ORIGIN",value:"*"},
+                {name:"UPLOADS_BUCKET",value:$UPLOADS},
+                {name:"PUBLIC_BASE_URL",value:$PUBLICBASE}
               ]
             | .containerDefinitions[0].secrets = [
                 {name:"DB_HOST",valueFrom:($SECRET+":host::")},

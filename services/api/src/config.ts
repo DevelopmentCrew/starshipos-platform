@@ -32,6 +32,14 @@ export const config = {
 
   // CORS: the frontend origin allowed to call this API.
   corsOrigin: optional('CORS_ORIGIN', 'http://localhost:5173'),
+
+  // File storage (replaces Base44 UploadFile). Uploads go to this S3 bucket via
+  // presigned PUT; files are read back through /api/files/raw/<key>. publicBaseUrl
+  // is the app's own origin so stored file_urls are absolute + same-origin.
+  storage: {
+    uploadsBucket: optional('UPLOADS_BUCKET', ''),
+    publicBaseUrl: optional('PUBLIC_BASE_URL', ''),
+  },
 } as const;
 
 export function assertRuntimeConfig(): void {

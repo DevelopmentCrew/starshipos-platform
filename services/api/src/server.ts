@@ -3,6 +3,7 @@ import cors from '@fastify/cors';
 import { config, assertRuntimeConfig } from './config.js';
 import { healthRoutes } from './routes/health.js';
 import { entityRoutes } from './routes/entities.js';
+import { fileRoutes } from './routes/files.js';
 
 export function buildServer() {
   const app = Fastify({
@@ -18,6 +19,7 @@ export function buildServer() {
 
   app.register(healthRoutes);
   app.register(entityRoutes);
+  app.register(fileRoutes);
 
   return app;
 }

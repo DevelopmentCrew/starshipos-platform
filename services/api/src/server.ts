@@ -7,6 +7,7 @@ import { entityRoutes } from './routes/entities.js';
 import { fileRoutes } from './routes/files.js';
 import { aiRoutes } from './routes/ai.js';
 import { emailRoutes } from './routes/email.js';
+import { functionRoutes } from './routes/functions.js';
 
 export function buildServer() {
   const app = Fastify({
@@ -25,6 +26,7 @@ export function buildServer() {
   app.register(fileRoutes);
   app.register(aiRoutes);
   app.register(emailRoutes);
+  app.register(functionRoutes);
 
   return app;
 }

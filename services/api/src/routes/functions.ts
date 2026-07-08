@@ -635,6 +635,56 @@ async function populateTimesheetFromSignIns(args: Args): Promise<unknown> {
   return { success: true, updated, sign_ins_found: weekSignIns.length, week_range: `${weekStart.toISOString().split('T')[0]} to ${weekEnd.toISOString().split('T')[0]}`, message: `Updated ${updated} timesheet entries from ${weekSignIns.length} sign-in records` };
 }
 
+// autoCreateCVRPackages — top up a development with a DevelopmentPrelim / DevelopmentProfessionalFee
+// record for every GLOBAL prelim/fee type it doesn't already have. Idempotent.
+async function autoCreateCVRPackages(args: Args, user: AuthUser): Promise<unknown> {
+  const developmentId = (args.developmentId || (args.event as any)?.entity_id) as string | undefined;
+  if (!developmentId) return { error: 'developmentId required' };
+  const dev = await query(`SELECT id FROM "development" WHERE id = $1 LIMIT 1`, [developmentId]);
+  if (!dev.rowCount) return { error: 'Development not found' };
+  const prelimTypes = await query<any>(`SELECT id, name, heading_id, heading_name FROM "prelim_cost_type" WHERE development_id IS NULL OR development_id = ''`);
+  const feeTypes = await query<any>(`SELECT id, name FROM "professional_fee_type" WHERE development_id IS NULL OR development_id = ''`);
+  const exP = await query<{ cost_type_id: string }>(`SELECT cost_type_id FROM "development_prelim" WHERE development_id = $1`, [developmentId]);
+  const exF = await query<{ fee_type_id: string }>(`SELECT fee_type_id FROM "development_professional_fee" WHERE development_id = $1`, [developmentId]);
+  const haveP = new Set(exP.rows.map((r) => r.cost_type_id));
+  const haveF = new Set(exF.rows.map((r) => r.fee_type_id));
+  const prelimsToCreate = prelimTypes.rows.filter((ct: any) => !haveP.has(ct.id));
+  const feesToCreate = feeTypes.rows.filter((pf: any) => !haveF.has(pf.id));
+  for (const ct of prelimsToCreate) {
+    await insertRow('development_prelim', { development_id: developmentId, cost_type_id: ct.id, cost_type_name: ct.name, heading_id: ct.heading_id, heading_name: ct.heading_name, budget_cost: 0 }, user);
+  }
+  for (const pf of feesToCreate) {
+    await insertRow('development_professional_fee', { development_id: developmentId, fee_type_id: pf.id, fee_type_name: pf.name, budget_cost: 0 }, user);
+  }
+  await query(`UPDATE "development" SET cvr_packages_provisioned=true, cvr_packages_provisioned_at=$1, cvr_packages_provisioned_by=$2, updated_date=$1 WHERE id=$3`,
+    [new Date().toISOString(), (args.triggered_by as string) || 'automation', developmentId]);
+  return { success: true, skipped: false, prelimsCreated: prelimsToCreate.length, feesCreated: feesToCreate.length };
+}
+
+// instantiatePlotMeasuredWorks — clone template measured-work items onto plots (qty/rate/total 0).
+async function instantiatePlotMeasuredWorks(args: Args, user: AuthUser): Promise<unknown> {
+  const development_id = args.development_id as string | undefined;
+  if (!development_id) return { error: 'development_id is required' };
+  const plotsToProcess = (args.plot_ids as string[] | undefined) || (args.plot_id ? [args.plot_id as string] : []);
+  if (plotsToProcess.length === 0) return { error: 'plot_id or plot_ids is required' };
+  const allItems = await query<any>(`SELECT * FROM "measured_work_master_item" WHERE development_id = $1`, [development_id]);
+  const templates = allItems.rows.filter((i: any) => i.is_template === true);
+  if (templates.length === 0) return { success: true, created: 0, message: 'No template items found — nothing to instantiate' };
+  let totalCreated = 0;
+  for (const pid of plotsToProcess) {
+    if (allItems.rows.some((i: any) => i.plot_id === pid)) continue;
+    for (const t of templates) {
+      await insertRow('measured_work_master_item', {
+        development_id, plot_id: pid, is_template: false, category: t.category || '', subcategory: t.subcategory || '',
+        reference_number: t.reference_number || '', name: t.name, unit: t.unit, quantity: 0, rate: 0, total_value: 0,
+        sort_order: t.sort_order || 0, is_subcategory_header: t.is_subcategory_header || false,
+      }, user);
+      totalCreated++;
+    }
+  }
+  return { success: true, created: totalCreated, message: `Created ${totalCreated} measured work items across ${plotsToProcess.length} plot(s)` };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -652,6 +702,8 @@ const handlers: Record<string, Handler> = {
   certifyAllPaymentPackLineItems: (args, user) => certifyAllPaymentPackLineItems(args, user),
   certifySubcontractorPayment: (args, user) => certifySubcontractorPayment(args, user),
   populateTimesheetFromSignIns: (args) => populateTimesheetFromSignIns(args),
+  autoCreateCVRPackages: (args, user) => autoCreateCVRPackages(args, user),
+  instantiatePlotMeasuredWorks: (args, user) => instantiatePlotMeasuredWorks(args, user),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

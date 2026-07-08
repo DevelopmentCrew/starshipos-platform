@@ -178,8 +178,36 @@ async function processInvoice(args: Args): Promise<unknown> {
   };
 }
 
+// getAppConfig — the admin user's app logo (Base44 getAppConfig).
+async function getAppConfig(): Promise<unknown> {
+  try {
+    const r = await query<{ app_logo_url: string | null }>(
+      `SELECT app_logo_url FROM "user" WHERE role = 'admin' ORDER BY created_date DESC NULLS LAST LIMIT 1`,
+    );
+    return { app_logo_url: r.rows[0]?.app_logo_url ?? null };
+  } catch {
+    return { app_logo_url: null };
+  }
+}
+
+// getAppUsers — all users for pickers, sorted by name.
+async function getAppUsers(): Promise<unknown> {
+  const r = await query(`SELECT * FROM "user" ORDER BY full_name NULLS LAST LIMIT 500`);
+  return { users: r.rows };
+}
+
+// getGoogleMapsKey — Maps key from env (set GOOGLE_MAPS_API_KEY to enable maps).
+async function getGoogleMapsKey(): Promise<unknown> {
+  const apiKey = process.env.GOOGLE_MAPS_API_KEY || '';
+  if (!apiKey) return { error: 'API key not configured' };
+  return { apiKey };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
+  getAppConfig: () => getAppConfig(),
+  getAppUsers: () => getAppUsers(),
+  getGoogleMapsKey: () => getGoogleMapsKey(),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

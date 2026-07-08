@@ -5,6 +5,20 @@ import { jsPDF } from 'jspdf';
 import { query } from '../db.js';
 import { authenticate, type AuthUser } from '../auth.js';
 import { invokeAI } from '../ai.js';
+import { sendEmail } from './email.js';
+import { buildAuthUrl, getConnection, listConnections, refreshConnection, type XeroConnection } from '../xero.js';
+
+const XERO_ORG_TEST = 'https://api.xero.com/api.xro/2.0/Organisation';
+async function xeroTokenValid(conn: XeroConnection): Promise<boolean> {
+  if (!conn.access_token) return false;
+  try {
+    const r = await fetch(XERO_ORG_TEST, { headers: { Authorization: `Bearer ${conn.access_token}`, 'Xero-tenant-id': conn.xero_tenant_id || '', Accept: 'application/json' } });
+    return r.ok;
+  } catch { return false; }
+}
+async function setConnStatus(id: string, status: string): Promise<void> {
+  await query(`UPDATE "xero_connection" SET status=$1, updated_date=$2 WHERE id=$3`, [status, new Date().toISOString(), id]);
+}
 
 const newId = (): string => crypto.randomBytes(12).toString('hex');
 const SYSCOLS = ['id', 'created_date', 'updated_date', 'created_by', 'created_by_id'];
@@ -1469,6 +1483,98 @@ async function importStarshipEmployees(args: Args, user: AuthUser): Promise<unkn
   return { ...results, dry_run: dryRun };
 }
 
+// --- Xero: OAuth + token management -----------------------------------------
+// generateXeroAuthUrl — admin: build the Xero consent URL for a company.
+async function generateXeroAuthUrl(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Unauthorized: Admin access required' };
+  const companyId = args.companyId as string | undefined;
+  if (!companyId) return { error: 'companyId is required' };
+  try {
+    return { authUrl: await buildAuthUrl(companyId) };
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
+}
+
+// manualRefreshXeroToken — admin: force a token refresh for a company's connection.
+async function manualRefreshXeroToken(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Unauthorized: Admin access required' };
+  const company_id = args.company_id as string | undefined;
+  if (!company_id) return { error: 'company_id is required' };
+  const conn = await getConnection(company_id);
+  if (!conn) return { error: 'No active Xero connection found for this company' };
+  try {
+    const token = await refreshConnection(conn);
+    return { success: true, message: `Token refreshed for ${conn.xero_tenant_name}`, expires_in: token.expires_in, new_expiry: new Date(Date.now() + token.expires_in * 1000).toISOString() };
+  } catch (e) {
+    return { success: false, error: (e as Error).message };
+  }
+}
+
+// refreshAllXeroTokens — proactively refresh any connection expiring within 30 min
+// or whose access token no longer validates. (Becomes a scheduled task.)
+async function refreshAllXeroTokens(): Promise<unknown> {
+  const conns = (await listConnections()).filter((c) => c.status === 'connected');
+  if (conns.length === 0) return { success: true, message: 'No active Xero connections found', refreshed: 0 };
+  let refreshed = 0;
+  const failed: { company_name: string | null; reason: string }[] = [];
+  for (const conn of conns) {
+    try {
+      if (!conn.refresh_token) { failed.push({ company_name: conn.company_name, reason: 'No refresh token available' }); continue; }
+      const minutesLeft = (new Date(conn.token_expiry || 0).getTime() - Date.now()) / 60000;
+      const valid = await xeroTokenValid(conn);
+      if (minutesLeft <= 30 || !valid) {
+        try { await refreshConnection(conn); refreshed++; }
+        catch (e) { failed.push({ company_name: conn.company_name, reason: (e as Error).message }); }
+      }
+    } catch (e) {
+      failed.push({ company_name: conn.company_name, reason: (e as Error).message });
+    }
+  }
+  return { success: true, message: `Processed ${conns.length} connections, refreshed ${refreshed}`, refreshed, failed_count: failed.length, failed_connections: failed.length ? failed : null };
+}
+
+// detectAndFixFailedXeroTokens — test each connection; on a 401 try a refresh, else
+// mark it expired; email an admin alert for any still-failing. (Becomes a scheduled task.)
+async function detectAndFixFailedXeroTokens(): Promise<unknown> {
+  const conns = await listConnections();
+  if (conns.length === 0) return { success: true, message: 'No Xero connections found', failedDetected: 0, repaired: 0 };
+  const failed: { id: string; company_name: string | null; reason: string }[] = [];
+  const repaired: { id: string; company_name: string | null; method: string }[] = [];
+  for (const conn of conns) {
+    if (!conn.access_token) { failed.push({ id: conn.id, company_name: conn.company_name, reason: 'No access token' }); continue; }
+    const valid = await xeroTokenValid(conn);
+    if (valid) continue;
+    failed.push({ id: conn.id, company_name: conn.company_name, reason: 'API test failed' });
+    if (conn.refresh_token) {
+      try {
+        await setConnStatus(conn.id, 'connected');
+        await refreshConnection(conn);
+        repaired.push({ id: conn.id, company_name: conn.company_name, method: 'token_refresh' });
+        const idx = failed.findIndex((f) => f.id === conn.id);
+        if (idx > -1) failed.splice(idx, 1);
+      } catch {
+        await setConnStatus(conn.id, 'expired');
+      }
+    } else {
+      await setConnStatus(conn.id, 'expired');
+    }
+  }
+  let alertSent = false;
+  if (failed.length > 0) {
+    try {
+      const list = failed.map((f) => `- ${f.company_name}: ${f.reason}`).join('\n');
+      await sendEmail({
+        to: 'davedargan@starshipgroup.co.uk',
+        subject: `Xero token failures - ${failed.length} connection(s) down`,
+        body: `Xero Token Failures Detected\n\nThese Xero connections are failing and need manual attention:\n\n${list}\n\nAutomatic recovery fixed ${repaired.length} connection(s). Total tested: ${conns.length}.`,
+      });
+      alertSent = true;
+    } catch { /* alert email best-effort */ }
+  }
+  return { success: true, message: `Tested ${conns.length} connections. Recovery fixed ${repaired.length}.`, failedDetected: failed.length, repaired: repaired.length, failed_connections: failed.length ? failed : null, repaired_connections: repaired.length ? repaired : null, alert_email_sent: alertSent };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -1505,6 +1611,10 @@ const handlers: Record<string, Handler> = {
   generateTimesheetExcel: (args) => generateTimesheetExcel(args),
   generatePaymentCertificate: (args, user) => generatePaymentCertificate(args, user),
   importStarshipEmployees: (args, user) => importStarshipEmployees(args, user),
+  generateXeroAuthUrl: (args, user) => generateXeroAuthUrl(args, user),
+  manualRefreshXeroToken: (args, user) => manualRefreshXeroToken(args, user),
+  refreshAllXeroTokens: () => refreshAllXeroTokens(),
+  detectAndFixFailedXeroTokens: () => detectAndFixFailedXeroTokens(),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

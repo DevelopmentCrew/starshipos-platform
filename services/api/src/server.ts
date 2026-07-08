@@ -8,6 +8,7 @@ import { fileRoutes } from './routes/files.js';
 import { aiRoutes } from './routes/ai.js';
 import { emailRoutes } from './routes/email.js';
 import { functionRoutes } from './routes/functions.js';
+import { xeroRoutes } from './routes/xero.js';
 
 export function buildServer() {
   const app = Fastify({
@@ -27,6 +28,7 @@ export function buildServer() {
   app.register(aiRoutes);
   app.register(emailRoutes);
   app.register(functionRoutes);
+  app.register(xeroRoutes);
 
   return app;
 }

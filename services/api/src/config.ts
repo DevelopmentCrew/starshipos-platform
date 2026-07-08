@@ -59,6 +59,22 @@ export const config = {
     region: optional('SES_REGION', optional('AWS_REGION', 'eu-west-2')),
     from: optional('EMAIL_FROM', 'noreply@starshipgroup.co.uk'),
   },
+
+  // Xero accounting integration. Client id/secret come from Secrets Manager
+  // (XERO_SECRET_ID, a JSON {client_id, client_secret}) or the plain env vars.
+  // redirectUri is where Xero returns the user after login — it must be registered
+  // in the Xero app and defaults to <PUBLIC_BASE_URL>/api/xero/callback.
+  // writeEnabled is the SAFETY GUARD: while false (the default), sync functions that
+  // would POST/PUT into Xero run in dry-run and never touch the live organisation.
+  xero: {
+    region: optional('AWS_REGION', 'eu-west-2'),
+    secretId: optional('XERO_SECRET_ID', 'starshipos-dev/xero-oauth'),
+    clientId: process.env.XERO_CLIENT_ID || '',
+    clientSecret: process.env.XERO_CLIENT_SECRET || '',
+    redirectUri: process.env.XERO_REDIRECT_URI || ((process.env.PUBLIC_BASE_URL || '') + '/api/xero/callback'),
+    writeEnabled: (process.env.XERO_WRITE_ENABLED || 'false').toLowerCase() === 'true',
+    scopes: optional('XERO_SCOPES', 'offline_access accounting.contacts accounting.transactions accounting.settings'),
+  },
 } as const;
 
 export function assertRuntimeConfig(): void {

@@ -480,6 +480,161 @@ async function reclassifyInvoiceToSubcontractor(args: Args, user: AuthUser): Pro
   return { success: true, message: 'Invoice reclassified to subcontractor and added to payment pack', po_id, payment_pack_id: pp.id, line_item_id: li.id };
 }
 
+// clearJ5Data — admin (+ PIN): wipe a development's manufacturing jobs, check responses
+// and delivery jobs, and reset its manufacture_started flag.
+async function clearJ5Data(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Forbidden: Admin access required' };
+  const development_id = args.development_id as string | undefined;
+  if (!development_id) return { error: 'development_id is required' };
+  if (args.pin !== '6370') return { error: 'Invalid PIN' };
+  const resp = await query(`DELETE FROM "j5_check_response" WHERE manufacturing_job_id IN (SELECT id FROM "manufacturing_job" WHERE development_id = $1)`, [development_id]);
+  const jobs = await query(`DELETE FROM "manufacturing_job" WHERE development_id = $1`, [development_id]);
+  const deliv = await query(`DELETE FROM "delivery_job" WHERE development_id = $1`, [development_id]);
+  await query(`UPDATE "development" SET manufacture_started=false, manufacture_started_at=NULL, manufacture_started_by=NULL, updated_date=$1 WHERE id=$2`, [new Date().toISOString(), development_id]);
+  const dj = jobs.rowCount ?? 0, dr = resp.rowCount ?? 0, dd = deliv.rowCount ?? 0;
+  return { success: true, deleted_jobs: dj, deleted_responses: dr, deleted_delivery_jobs: dd, message: `Cleared ${dj} manufacturing jobs, ${dr} check responses and ${dd} delivery jobs` };
+}
+
+// certifyAllPaymentPackLineItems — certify every matched/uploaded line in a pack.
+async function certifyAllPaymentPackLineItems(args: Args, user: AuthUser): Promise<unknown> {
+  const payment_pack_id = args.payment_pack_id as string | undefined;
+  if (!payment_pack_id) return { error: 'payment_pack_id required' };
+  const items = await query<any>(`SELECT id, certification_status, invoice_status FROM "payment_pack_line_item" WHERE payment_pack_id = $1`, [payment_pack_id]);
+  const now = new Date().toISOString();
+  let certified = 0;
+  for (const it of items.rows) {
+    if (it.certification_status !== 'certified' && (it.invoice_status === 'matched' || it.invoice_status === 'uploaded')) {
+      await query(`UPDATE "payment_pack_line_item" SET certification_status='certified', certified_by=$1, certified_at=$2, updated_date=$2 WHERE id=$3`, [user.email, now, it.id]);
+      certified++;
+    }
+  }
+  return { success: true, message: `Certified ${certified} line item${certified !== 1 ? 's' : ''}`, certified_count: certified };
+}
+
+// certifySubcontractorPayment — certify (creates a subcontractor PO + closes the pack when
+// all lines done) or query a payment pack line item.
+async function certifySubcontractorPayment(args: Args, user: AuthUser): Promise<unknown> {
+  const id = args.payment_pack_line_item_id as string | undefined;
+  const action = args.action as string | undefined;
+  if (!id || !action) return { error: 'Missing required parameters' };
+  if (!['certify', 'query'].includes(action)) return { error: 'Invalid action' };
+  const liR = await query<any>(`SELECT * FROM "payment_pack_line_item" WHERE id = $1 LIMIT 1`, [id]);
+  if (!liR.rowCount) return { error: 'Line item not found' };
+  const lineItem = liR.rows[0];
+  const now = new Date().toISOString();
+
+  if (action === 'query') {
+    await query(`UPDATE "payment_pack_line_item" SET certification_status='queried', invoice_status='queried', query_notes=$1, updated_date=$2 WHERE id=$3`, [args.query_notes || '', now, id]);
+    return { success: true, message: 'Payment queried' };
+  }
+
+  const ppR = await query<any>(`SELECT * FROM "payment_pack" WHERE id = $1 LIMIT 1`, [lineItem.payment_pack_id]);
+  const paymentPack = ppR.rows[0];
+  if (!paymentPack) return { error: 'Payment pack not found' };
+
+  if (!lineItem.invoice_status || lineItem.invoice_status === 'pending' || (Number(lineItem.net_total_payable) || 0) === 0) {
+    const preserved = lineItem.previously_claimed || lineItem.cumulative_claimed || 0;
+    await query(`UPDATE "payment_pack_line_item" SET certification_status='certified', certified_by=$1, certified_at=$2, invoice_status=$3, cumulative_claimed=$4, updated_date=$2 WHERE id=$5`, [user.email, now, lineItem.invoice_status || 'pending', preserved, id]);
+  }
+
+  const devR = await query<any>(`SELECT * FROM "development" WHERE id = $1 LIMIT 1`, [paymentPack.development_id]);
+  if (!devR.rowCount) return { error: 'Development not found' };
+  const dev = devR.rows[0];
+  const seqR = await query<{ n: number }>(`SELECT count(*)::int AS n FROM "purchase_order" WHERE development_id=$1 AND invoice_type='subcontractor'`, [paymentPack.development_id]);
+  const seq = Number(seqR.rows[0].n) + 1;
+  const compR = await query<{ po_prefix: string | null }>(`SELECT po_prefix FROM "company" WHERE id = $1 LIMIT 1`, [dev.company_id]);
+  const prefix = compR.rows[0]?.po_prefix || dev.development_code;
+  const poNumber = `${prefix}-${dev.development_code}-${String(paymentPack.period).split('-')[1]}-${String(seq).padStart(4, '0')}`;
+  const uR = await query<{ full_name: string | null }>(`SELECT full_name FROM "user" WHERE lower(email)=lower($1) LIMIT 1`, [user.email ?? '']);
+
+  const po = await insertRow('purchase_order', {
+    company_id: dev.company_id, company_name: dev.company_name, supplier_id: lineItem.subcontractor_id, supplier_name: lineItem.subcontractor_name,
+    development_id: paymentPack.development_id, development_name: paymentPack.development_name, po_number: poNumber, status: 'invoiced', invoice_type: 'subcontractor',
+    total_value: lineItem.net_total_payable, delivered_value: lineItem.net_total_payable, outstanding_value: 0,
+    supplier_invoice_number: lineItem.invoice_number, invoice_date: lineItem.invoice_date, invoice_file_url: lineItem.invoice_file_url,
+    invoiced_value: lineItem.invoice_value, extracted_line_items: lineItem.extracted_line_items || [],
+    raised_date: now.split('T')[0], raised_by: user.email, raised_by_name: uR.rows[0]?.full_name || user.email,
+    required_by_date: now.split('T')[0], delivery_address: `Payment Pack ${paymentPack.period}`, xero_sync_status: 'pending',
+  }, user);
+
+  await query(`UPDATE "payment_pack_line_item" SET certification_status='certified', certified_by=$1, certified_at=$2, invoice_status='certified', purchase_order_id=$3, purchase_order_number=$4, updated_date=$2 WHERE id=$5`, [user.email, now, po.id, poNumber, id]);
+
+  const allItems = await query<any>(`SELECT id, certification_status FROM "payment_pack_line_item" WHERE payment_pack_id = $1`, [lineItem.payment_pack_id]);
+  const allCertified = allItems.rows.every((li: any) => li.id === id || li.certification_status === 'certified');
+  if (allCertified) await query(`UPDATE "payment_pack" SET status='closed', updated_date=$1 WHERE id=$2`, [now, lineItem.payment_pack_id]);
+
+  return { success: true, message: 'Payment certified', purchase_order_id: po.id, purchase_order_number: poNumber };
+}
+
+// populateTimesheetFromSignIns — fill a timesheet's daily hours from sign-in/out records.
+const TS_DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+function tsMinutes(hhmm: string): number { const [h, m] = String(hhmm).split(':').map(Number); return h * 60 + m; }
+function tsShiftHours(signIn: string, signOut: string, shift: any): number {
+  const shiftStart = tsMinutes(shift.start_time), shiftEnd = tsMinutes(shift.end_time);
+  const si = new Date(signIn), so = new Date(signOut);
+  const siMin = si.getHours() * 60 + si.getMinutes(), soMin = so.getHours() * 60 + so.getMinutes();
+  let effStart = shiftStart, effEnd = shiftEnd;
+  if (siMin - shiftStart >= 15) effStart = siMin;
+  if (shiftEnd - soMin >= 15) effEnd = soMin;
+  const worked = effEnd - effStart;
+  if (worked <= 0) return 0;
+  return Math.min(worked / 60, Number(shift.max_hours));
+}
+async function populateTimesheetFromSignIns(args: Args): Promise<unknown> {
+  const timesheet_id = args.timesheet_id as string | undefined;
+  if (!timesheet_id) return { error: 'timesheet_id required' };
+  const tsR = await query<any>(`SELECT * FROM "timesheet" WHERE id = $1 LIMIT 1`, [timesheet_id]);
+  if (!tsR.rowCount) return { error: 'Timesheet not found' };
+  const timesheet = tsR.rows[0];
+  const shiftsR = await query<any>(`SELECT * FROM "shift" WHERE development_id = $1`, [timesheet.development_id]);
+  if (!shiftsR.rowCount) return { error: 'No shifts configured for this development', updated: 0 };
+  const shifts = shiftsR.rows;
+
+  const weekEndDate = new Date(timesheet.week_ending_date);
+  const weekEndDay = weekEndDate.getDay();
+  const daysFromMonday = weekEndDay === 0 ? 6 : weekEndDay - 1;
+  const weekStartDate = new Date(weekEndDate); weekStartDate.setDate(weekEndDate.getDate() - daysFromMonday);
+  const weekDays: Record<string, Date> = {};
+  for (let i = 0; i < 7; i++) { const d = new Date(weekStartDate); d.setDate(weekStartDate.getDate() + i); weekDays[TS_DAYS[d.getDay()]] = d; }
+
+  const entriesR = await query<any>(`SELECT * FROM "timesheet_entry" WHERE timesheet_id = $1`, [timesheet_id]);
+  if (!entriesR.rowCount) return { error: 'No entries in timesheet', updated: 0 };
+  const signInsR = await query<any>(`SELECT * FROM "sign_in_record" WHERE development_id = $1`, [timesheet.development_id]);
+  const weekStart = new Date(weekStartDate); weekStart.setHours(0, 0, 0, 0);
+  const weekEnd = new Date(weekEndDate); weekEnd.setHours(23, 59, 59, 999);
+  const weekSignIns = signInsR.rows.filter((r: any) => { const t = new Date(r.sign_in_time); return t >= weekStart && t <= weekEnd && r.sign_out_time; });
+
+  const cols = await tableCols('timesheet_entry');
+  let updated = 0;
+  for (const entry of entriesR.rows) {
+    const upd: Record<string, unknown> = {};
+    let hasAny = false;
+    for (const [dayName, dayDate] of Object.entries(weekDays)) {
+      const dow = dayDate.getDay();
+      const shift = shifts.find((s: any) => Array.isArray(s.days_of_week) && s.days_of_week.includes(dow));
+      if (!shift) continue;
+      const dayStr = dayDate.toISOString().split('T')[0];
+      const dayRecords = weekSignIns.filter((r: any) => new Date(r.sign_in_time).toISOString().split('T')[0] === dayStr && r.visitor_name?.toLowerCase() === entry.employee_name?.toLowerCase());
+      if (dayRecords.length === 0) continue;
+      const earliest = dayRecords.reduce((a: any, b: any) => (new Date(a.sign_in_time) < new Date(b.sign_in_time) ? a : b));
+      const latest = dayRecords.reduce((a: any, b: any) => (new Date(a.sign_out_time) > new Date(b.sign_out_time) ? a : b));
+      const hrs = Math.round(tsShiftHours(earliest.sign_in_time, latest.sign_out_time, shift) * 4) / 4;
+      upd[`${dayName}_sign_in_hours`] = hrs;
+      upd[`${dayName}_hours`] = hrs;
+      hasAny = true;
+    }
+    if (hasAny && entry.id) {
+      const keys = Object.keys(upd).filter((k) => cols.has(k));
+      if (keys.length) {
+        upd['updated_date'] = new Date().toISOString(); keys.push('updated_date');
+        await query(`UPDATE "timesheet_entry" SET ${keys.map((k, i) => `"${k}"=$${i + 1}`).join(', ')} WHERE id=$${keys.length + 1}`, [...keys.map((k) => upd[k]), entry.id]);
+        updated++;
+      }
+    }
+  }
+  return { success: true, updated, sign_ins_found: weekSignIns.length, week_range: `${weekStart.toISOString().split('T')[0]} to ${weekEnd.toISOString().split('T')[0]}`, message: `Updated ${updated} timesheet entries from ${weekSignIns.length} sign-in records` };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -493,6 +648,10 @@ const handlers: Record<string, Handler> = {
   undeliverPOLineItems: (args, user) => undeliverPOLineItems(args, user),
   updateJ5UserCell: (args, user) => updateJ5UserCell(args, user),
   reclassifyInvoiceToSubcontractor: (args, user) => reclassifyInvoiceToSubcontractor(args, user),
+  clearJ5Data: (args, user) => clearJ5Data(args, user),
+  certifyAllPaymentPackLineItems: (args, user) => certifyAllPaymentPackLineItems(args, user),
+  certifySubcontractorPayment: (args, user) => certifySubcontractorPayment(args, user),
+  populateTimesheetFromSignIns: (args) => populateTimesheetFromSignIns(args),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

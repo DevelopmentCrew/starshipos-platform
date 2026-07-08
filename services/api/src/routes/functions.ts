@@ -203,11 +203,61 @@ async function getGoogleMapsKey(): Promise<unknown> {
   return { apiKey };
 }
 
+// generateIncidentReference — next HSE/accident reference for a development.
+async function generateIncidentReference(args: Args): Promise<unknown> {
+  const development_id = args.development_id as string | undefined;
+  const report_type = args.report_type as string | undefined;
+  if (!development_id) return { error: 'development_id is required' };
+  const dev = await query<{ development_code: string | null }>('SELECT development_code FROM "development" WHERE id = $1 LIMIT 1', [development_id]);
+  if (!dev.rowCount) return { error: 'Development not found' };
+  const code = dev.rows[0].development_code || 'UNK';
+  const prefix = report_type === 'Accident' ? 'ACC' : 'IND';
+  const rows = await query<{ reference: string | null }>(
+    'SELECT reference FROM "incident_report" WHERE development_id = $1 AND reference LIKE $2',
+    [development_id, `${prefix}-${code}-%`],
+  );
+  let maxSeq = 0;
+  for (const r of rows.rows) {
+    const parts = (r.reference || '').split('-');
+    if (parts.length === 3) { const s = parseInt(parts[2], 10); if (!Number.isNaN(s) && s > maxSeq) maxSeq = s; }
+  }
+  return { reference: `${prefix}-${code}-${String(maxSeq + 1).padStart(3, '0')}` };
+}
+
+// checkCategoryTransactions — does a package category have work/dev packages?
+async function checkCategoryTransactions(args: Args): Promise<unknown> {
+  const category_id = args.category_id as string | undefined;
+  const development_id = args.development_id as string | undefined;
+  if (!category_id || !development_id) return { error: 'category_id and development_id required' };
+  const wp = await query<{ n: number }>('SELECT count(*)::int AS n FROM "work_package" WHERE development_id = $1 AND package_category_id = $2', [development_id, category_id]);
+  const dp = await query<{ n: number }>('SELECT count(*)::int AS n FROM "development_package" WHERE development_id = $1 AND package_category_id = $2', [development_id, category_id]);
+  const w = Number(wp.rows[0].n), d = Number(dp.rows[0].n);
+  return { has_transactions: w > 0 || d > 0, work_packages: w, dev_packages: d };
+}
+
+// reassignTransactionDevelopment — admin: move a historical transaction to another development.
+async function reassignTransactionDevelopment(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Unauthorized' };
+  const transactionId = args.transactionId as string | undefined;
+  const newDevelopmentId = args.newDevelopmentId as string | undefined;
+  if (!transactionId || !newDevelopmentId) return { error: 'Missing transactionId or newDevelopmentId' };
+  const txn = await query<{ reference: string | null; development_name: string | null }>('SELECT reference, development_name FROM "historical_transaction" WHERE id = $1 LIMIT 1', [transactionId]);
+  if (!txn.rowCount) return { error: 'Transaction not found' };
+  const dev = await query<{ name: string | null }>('SELECT name FROM "development" WHERE id = $1 LIMIT 1', [newDevelopmentId]);
+  if (!dev.rowCount) return { error: 'Development not found' };
+  await query('UPDATE "historical_transaction" SET development_id = $1, development_name = $2, updated_date = $3 WHERE id = $4',
+    [newDevelopmentId, dev.rows[0].name, new Date().toISOString(), transactionId]);
+  return { message: `Reassigned transaction "${txn.rows[0].reference}" from ${txn.rows[0].development_name || 'unknown'} to ${dev.rows[0].name}`, transaction: transactionId };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
   getAppUsers: () => getAppUsers(),
   getGoogleMapsKey: () => getGoogleMapsKey(),
+  generateIncidentReference: (args) => generateIncidentReference(args),
+  checkCategoryTransactions: (args) => checkCategoryTransactions(args),
+  reassignTransactionDevelopment: (args, user) => reassignTransactionDevelopment(args, user),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

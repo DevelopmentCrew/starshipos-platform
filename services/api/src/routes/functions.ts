@@ -6,7 +6,7 @@ import { query } from '../db.js';
 import { authenticate, type AuthUser } from '../auth.js';
 import { invokeAI } from '../ai.js';
 import { sendEmail } from './email.js';
-import { buildAuthUrl, getConnection, listConnections, refreshConnection, type XeroConnection } from '../xero.js';
+import { buildAuthUrl, getConnection, listConnections, refreshConnection, xeroApiJson, parseXeroDate, type XeroConnection } from '../xero.js';
 
 const XERO_ORG_TEST = 'https://api.xero.com/api.xro/2.0/Organisation';
 async function xeroTokenValid(conn: XeroConnection): Promise<boolean> {
@@ -1575,6 +1575,209 @@ async function detectAndFixFailedXeroTokens(): Promise<unknown> {
   return { success: true, message: `Tested ${conns.length} connections. Recovery fixed ${repaired.length}.`, failedDetected: failed.length, repaired: repaired.length, failed_connections: failed.length ? failed : null, repaired_connections: repaired.length ? repaired : null, alert_email_sent: alertSent };
 }
 
+// --- Xero: read-only syncs (safe — never write into Xero) --------------------
+async function companyNameOf(companyId: string): Promise<string> {
+  const r = await query<{ company_name: string | null }>(`SELECT company_name FROM "company" WHERE id = $1 LIMIT 1`, [companyId]);
+  return r.rows[0]?.company_name || 'Unknown';
+}
+
+// getXeroTaxRates — cached tax rates for a company; fetches + caches from Xero on
+// a cache miss or force_refresh.
+async function getXeroTaxRates(args: Args, user: AuthUser): Promise<unknown> {
+  const company_id = args.company_id as string | undefined;
+  if (!company_id) return { error: 'company_id is required' };
+  if (!args.force_refresh) {
+    const cached = await query<any>(`SELECT tax_type, tax_type_name, effective_tax_rate FROM "xero_tax_rate" WHERE company_id = $1`, [company_id]);
+    if (cached.rowCount) return { taxRates: cached.rows };
+  }
+  const conn = await getConnection(company_id);
+  if (!conn) return { error: 'No active Xero connection found for this company' };
+  const data = await xeroApiJson<{ TaxRates?: any[] }>(conn, '/TaxRates');
+  const taxRates = (data?.TaxRates || [])
+    .filter((r) => r.TaxType && r.CanApplyToInputs)
+    .map((r) => ({ tax_type: r.TaxType, tax_type_name: r.DisplayTaxRate || r.Description || r.TaxType, effective_tax_rate: parseFloat(r.EffectiveRate) || 0 }));
+  const companyName = await companyNameOf(company_id);
+  for (const t of taxRates) {
+    await insertRow('xero_tax_rate', { company_id, company_name: companyName, xero_tenant_id: conn.xero_tenant_id, ...t, last_synced: new Date().toISOString() }, user);
+  }
+  return { taxRates };
+}
+
+// syncXeroTaxRates — admin: replace a company's cached tax rates from Xero.
+async function syncXeroTaxRates(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Forbidden: Admin access required' };
+  const company_id = args.company_id as string | undefined;
+  if (!company_id) return { error: 'company_id is required' };
+  const conn = await getConnection(company_id);
+  if (!conn) return { error: 'No active Xero connection found for this company' };
+  const data = await xeroApiJson<{ TaxRates?: any[] }>(conn, '/TaxRates');
+  const taxRates = (data?.TaxRates || [])
+    .filter((r) => r.TaxType && r.CanApplyToInputs)
+    .map((r) => ({ tax_type: r.TaxType, tax_type_name: r.DisplayTaxRate || r.Description || r.TaxType, effective_tax_rate: parseFloat(r.EffectiveRate) || 0 }));
+  await query(`DELETE FROM "xero_tax_rate" WHERE company_id = $1`, [company_id]);
+  const companyName = await companyNameOf(company_id);
+  for (const t of taxRates) {
+    await insertRow('xero_tax_rate', { company_id, company_name: companyName, xero_tenant_id: conn.xero_tenant_id, ...t, last_synced: new Date().toISOString() }, user);
+  }
+  return { success: true, synced_count: taxRates.length };
+}
+
+// syncXeroAccountCodes — admin: import active Xero account codes for a company (new only).
+async function syncXeroAccountCodes(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Admin access required' };
+  const company_id = args.company_id as string | undefined;
+  if (!company_id) return { error: 'company_id is required' };
+  const conn = await getConnection(company_id);
+  if (!conn) return { error: 'No active Xero connection found for this company' };
+  const data = await xeroApiJson<{ Accounts?: any[] }>(conn, `/Accounts?where=${encodeURIComponent('Status=="ACTIVE"')}`);
+  const accounts = data?.Accounts || [];
+  const companyName = await companyNameOf(company_id);
+  const existing = await query<{ code: string | null }>(`SELECT code FROM "xero_account_code" WHERE company_id = $1`, [company_id]);
+  const have = new Set(existing.rows.map((a) => a.code));
+  let created = 0;
+  for (const a of accounts) {
+    if (!a.Code || have.has(a.Code)) continue;
+    await insertRow('xero_account_code', { company_id, company_name: companyName, xero_tenant_id: conn.xero_tenant_id, code: a.Code, name: a.Name, type: a.Type, last_synced: new Date().toISOString() }, user);
+    created++;
+  }
+  return { success: true, message: `Synced ${created} account codes from Xero`, count: created };
+}
+
+// Shared incremental invoice sync for one connection (ACCPAY invoices + ACCPAYCREDIT
+// credit notes, stored in xero_invoice; credit notes as negative amounts). READ-ONLY
+// against Xero — only our own DB is written. Advances the per-org watermark.
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function syncCompanyInvoices(conn: XeroConnection, watermarkIso: string, user: AuthUser): Promise<Record<string, unknown>> {
+  const tenantId = conn.xero_tenant_id;
+  const companyId = conn.company_id;
+  const companyName = conn.company_name || '';
+  const [y, m, d] = watermarkIso.split('T')[0].split('-');
+  const where = `UpdatedDateUTC>=DateTime(${y},${m},${d})`;
+  const syncedAt = new Date().toISOString();
+
+  const allInvoices: any[] = [];
+  let page = 1;
+  const pageSize = 100;
+  while (true) {
+    const path = `/Invoices?Type=ACCPAY&Statuses=AUTHORISED,PAID,VOIDED&where=${encodeURIComponent(where)}&page=${page}&pageSize=${pageSize}&order=${encodeURIComponent('UpdatedDateUTC ASC')}`;
+    const data = await xeroApiJson<{ Invoices?: any[] }>(conn, path);
+    const invs = data?.Invoices || [];
+    allInvoices.push(...invs);
+    if (invs.length < pageSize || page >= 50) break;
+    page++;
+    await sleep(300);
+  }
+  let creditNotes: any[] = [];
+  try {
+    const cnData = await xeroApiJson<{ CreditNotes?: any[] }>(conn, `/CreditNotes?Type=ACCPAYCREDIT&Statuses=AUTHORISED,PAID&where=${encodeURIComponent(where)}&pageSize=100`);
+    creditNotes = cnData?.CreditNotes || [];
+  } catch { /* credit-note fetch is best-effort */ }
+
+  const existing = await query<any>(`SELECT id, invoice_id, status, amount_due, amount_paid, gross, date_paid, invoice_type FROM "xero_invoice" WHERE company_id = $1`, [companyId]);
+  const existingMap = new Map<string, any>();
+  for (const inv of existing.rows) if (!existingMap.has(inv.invoice_id)) existingMap.set(inv.invoice_id, inv);
+
+  let created = 0, updated = 0, skipped = 0;
+  const upsert = async (record: Record<string, unknown>, changed: (e: any) => boolean) => {
+    const ex = existingMap.get(record.invoice_id as string);
+    if (ex) {
+      if (changed(ex)) {
+        const keys = Object.keys(record);
+        await query(`UPDATE "xero_invoice" SET ${keys.map((k, i) => `"${k}"=$${i + 1}`).join(', ')}, updated_date=$${keys.length + 1} WHERE id=$${keys.length + 2}`, [...keys.map((k) => record[k]), syncedAt, ex.id]);
+        updated++;
+      } else skipped++;
+    } else {
+      await insertRow('xero_invoice', record, user);
+      created++;
+    }
+  };
+
+  for (const inv of allInvoices) {
+    const record = {
+      invoice_id: inv.InvoiceID, company_id: companyId, company_name: companyName, xero_tenant_id: tenantId,
+      invoice_number: inv.InvoiceNumber || inv.Reference || '—', reference: inv.Reference || '', supplier: inv.Contact?.Name || '—',
+      invoice_date: parseXeroDate(inv.Date), due_date: parseXeroDate(inv.DueDate), status: inv.Status, invoice_type: 'ACCPAY',
+      net: inv.SubTotal || 0, tax: inv.TotalTax || 0, gross: inv.Total || 0, amount_due: inv.AmountDue || 0, amount_paid: inv.AmountPaid || 0,
+      date_paid: parseXeroDate(inv.FullyPaidOnDate), currency: inv.CurrencyCode || 'GBP', synced_at: syncedAt,
+    };
+    await upsert(record, (e) => e.status !== record.status || Number(e.amount_due) !== record.amount_due || Number(e.amount_paid) !== record.amount_paid || Number(e.gross) !== record.gross || e.date_paid !== record.date_paid || e.invoice_type !== record.invoice_type);
+  }
+  for (const cn of creditNotes) {
+    const cnId = `CN-${cn.CreditNoteID}`;
+    const record = {
+      invoice_id: cnId, company_id: companyId, company_name: companyName, xero_tenant_id: tenantId,
+      invoice_number: cn.CreditNoteNumber || '—', reference: cn.Reference || '', supplier: cn.Contact?.Name || '—',
+      invoice_date: parseXeroDate(cn.Date), due_date: parseXeroDate(cn.Date), status: cn.Status, invoice_type: 'ACCPAYCREDIT',
+      net: -(cn.SubTotal || 0), tax: -(cn.TotalTax || 0), gross: -(cn.Total || 0), amount_due: -(cn.RemainingCredit || 0), amount_paid: 0,
+      date_paid: null, currency: cn.CurrencyCode || 'GBP', synced_at: syncedAt,
+    };
+    await upsert(record, (e) => Number(e.gross) !== record.gross || Number(e.amount_due) !== record.amount_due || e.status !== record.status);
+  }
+  await query(`UPDATE "xero_connection" SET last_sync_date=$1, updated_date=$2 WHERE id=$3`, [syncedAt, syncedAt, conn.id]);
+  return { company: companyName, total_fetched: allInvoices.length, credit_notes: creditNotes.length, created, updated, skipped, watermark: syncedAt };
+}
+
+// syncXeroInvoices — incremental ACCPAY invoice sync for one company.
+async function syncXeroInvoices(args: Args, user: AuthUser): Promise<unknown> {
+  const company_id = args.company_id as string | undefined;
+  if (!company_id) return { error: 'company_id is required' };
+  const conn = await getConnection(company_id);
+  if (!conn) return { error: 'No active Xero connection found for this company' };
+  const watermark = (args.from_date as string | undefined) || conn.last_sync_date || '2024-04-01T00:00:00.000Z';
+  const result = await syncCompanyInvoices(conn, String(watermark), user);
+  return { success: true, ...result };
+}
+
+// syncAllXeroInvoices — incremental ACCPAY sync across every connected org (scheduled job).
+async function syncAllXeroInvoices(_args: Args, user: AuthUser): Promise<unknown> {
+  const conns = (await listConnections()).filter((c) => c.status === 'connected');
+  if (conns.length === 0) return { message: 'No connected Xero orgs found' };
+  const results: unknown[] = [];
+  for (const conn of conns) {
+    try {
+      const watermark = String(conn.last_sync_date || '2024-04-01T00:00:00.000Z');
+      results.push({ ...(await syncCompanyInvoices(conn, watermark, user)), success: true });
+    } catch (e) {
+      results.push({ company: conn.company_name, success: false, error: (e as Error).message });
+    }
+    await sleep(2000);
+  }
+  return { success: true, synced_at: new Date().toISOString(), results };
+}
+
+// lookupVAT — validate a UK VAT number (HMRC, keyless) or look up a company by name
+// (Companies House, needs COMPANIES_HOUSE_API_KEY). Not a Xero call.
+async function lookupVAT(args: Args): Promise<unknown> {
+  const vat_number = args.vat_number as string | undefined;
+  const company_name = args.company_name as string | undefined;
+  if (vat_number) {
+    const cleaned = vat_number.replace(/\s/g, '').replace(/^GB/i, '');
+    const res = await fetch(`https://api.service.hmrc.gov.uk/organisations/vat/check-vat-number/lookup/${cleaned}`, { headers: { Accept: 'application/json' } });
+    if (res.status === 404) return { valid: false, message: 'VAT number not found' };
+    if (!res.ok) { const e = await res.json().catch(() => ({})); return { valid: false, message: (e as any).message || `VAT lookup failed (${res.status})` }; }
+    const data = await res.json() as any;
+    const a = data.target?.address;
+    const address = a ? [a.line1, a.line2, a.line3, a.postcode, a.countryCode].filter(Boolean).join(', ') : null;
+    return { valid: true, name: data.target?.name, address, vat_number: `GB${cleaned}` };
+  }
+  if (company_name) {
+    const chApiKey = process.env.COMPANIES_HOUSE_API_KEY;
+    if (!chApiKey) return { valid: false, message: 'Company-name lookup needs COMPANIES_HOUSE_API_KEY to be configured' };
+    const auth = `Basic ${Buffer.from(chApiKey + ':').toString('base64')}`;
+    const chRes = await fetch(`https://api.company-information.service.gov.uk/search/companies?q=${encodeURIComponent(company_name)}&items_per_page=5`, { headers: { Accept: 'application/json', Authorization: auth } });
+    if (!chRes.ok) return { valid: false, message: `Could not find "${company_name}" on Companies House` };
+    const chData = await chRes.json() as any;
+    const top = chData.items?.[0];
+    if (!top) return { valid: false, message: `Could not find "${company_name}" on Companies House` };
+    const profileRes = await fetch(`https://api.company-information.service.gov.uk/company/${top.company_number}`, { headers: { Accept: 'application/json', Authorization: auth } });
+    const profile = profileRes.ok ? await profileRes.json() as any : null;
+    const addr = profile?.registered_office_address;
+    const address = addr ? [addr.address_line_1, addr.address_line_2, addr.locality, addr.postal_code, addr.country].filter(Boolean).join(', ') : top.address_snippet;
+    return { valid: true, name: top.title, companies_house_number: top.company_number, address, company_status: top.company_status, incorporated_date: profile?.date_of_creation || null, found_by_name: true };
+  }
+  return { error: 'Either vat_number or company_name is required' };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -1615,6 +1818,12 @@ const handlers: Record<string, Handler> = {
   manualRefreshXeroToken: (args, user) => manualRefreshXeroToken(args, user),
   refreshAllXeroTokens: () => refreshAllXeroTokens(),
   detectAndFixFailedXeroTokens: () => detectAndFixFailedXeroTokens(),
+  getXeroTaxRates: (args, user) => getXeroTaxRates(args, user),
+  syncXeroTaxRates: (args, user) => syncXeroTaxRates(args, user),
+  syncXeroAccountCodes: (args, user) => syncXeroAccountCodes(args, user),
+  syncXeroInvoices: (args, user) => syncXeroInvoices(args, user),
+  syncAllXeroInvoices: (args, user) => syncAllXeroInvoices(args, user),
+  lookupVAT: (args) => lookupVAT(args),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

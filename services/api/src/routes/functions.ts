@@ -809,6 +809,405 @@ async function importProfessionalFees(args: Args, user: AuthUser): Promise<unkno
   return { success: true, imported, failed: failures.length, failures, message: `Imported ${imported} item(s)${failures.length > 0 ? `, ${failures.length} failed` : ''}` };
 }
 
+// ---- Budget auto-provision ---------------------------------------------------
+// Shared: recompute a work_items array, replacing/adding the single is_provision item.
+function withProvision(workItems: any[], provisionValue: number, reference: string, extra: Record<string, unknown> = {}): any[] {
+  const idx = workItems.findIndex((wi) => wi?.is_provision === true);
+  if (idx >= 0) {
+    return workItems.map((wi, i) => (i === idx ? { ...wi, value: provisionValue, description: 'Auto Provision to Budget', classification: 'Provisions' } : wi));
+  }
+  return [...workItems, { reference, description: 'Auto Provision to Budget', classification: 'Provisions', value: provisionValue, is_provision: true, ...extra }];
+}
+function sumItems(items: any[], predicate: (i: any) => boolean = () => true): number {
+  return items.filter(predicate).reduce((s, i) => s + (Number(i?.value) || 0), 0);
+}
+async function updateWorkItems(table: string, id: string, workItems: any[], total?: number): Promise<void> {
+  const cols = await tableCols(table);
+  const sets: string[] = ['work_items = $1'];
+  const vals: unknown[] = [JSON.stringify(workItems)];
+  if (total !== undefined && cols.has('total_package_value')) { vals.push(total); sets.push(`total_package_value = $${vals.length}`); }
+  vals.push(new Date().toISOString()); sets.push(`updated_date = $${vals.length}`);
+  vals.push(id);
+  await query(`UPDATE "${table}" SET ${sets.join(', ')} WHERE id = $${vals.length}`, vals);
+}
+
+// autoProvisionWorkPackages — top every work package (or its linked development packages)
+// up to its locked budget with a single "Auto Provision to Budget" line item. Idempotent.
+async function autoProvisionWorkPackages(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') {
+    const u = await query<{ can_manage_budgets: boolean | null }>(`SELECT can_manage_budgets FROM "user" WHERE lower(email)=lower($1) LIMIT 1`, [user.email ?? '']);
+    if (!u.rows[0]?.can_manage_budgets) return { error: 'Forbidden: Budget management permission required' };
+  }
+  const developmentId = args.developmentId as string | undefined;
+  if (!developmentId) return { error: 'developmentId is required' };
+  const devR = await query<any>(`SELECT * FROM "development" WHERE id = $1 LIMIT 1`, [developmentId]);
+  if (!devR.rowCount) return { error: 'Development not found' };
+  const development = devR.rows[0];
+  if (!development.budget_locked) return { error: 'Budget must be locked before running Auto Provision' };
+
+  const wpR = await query<any>(`SELECT * FROM "work_package" WHERE development_id = $1`, [developmentId]);
+  const dpR = await query<any>(`SELECT * FROM "development_package" WHERE development_id = $1`, [developmentId]);
+  const workPackages = wpR.rows, devPackages = dpR.rows;
+
+  let updated = 0, created = 0;
+  for (const wp of workPackages) {
+    const budget = Number(wp.budget_cost) || 0;
+    const linked = devPackages.filter((dp: any) => dp.work_package_id === wp.id);
+
+    if (linked.length === 0 && budget > 0) {
+      const workItems: any[] = Array.isArray(wp.work_items) ? wp.work_items : [];
+      const allocated = sumItems(workItems);
+      const provisionValue = Math.max(0, budget - allocated);
+      if (provisionValue > 0) {
+        await updateWorkItems('work_package', wp.id, [...workItems, { reference: 'PROV', description: 'Auto Provision to Budget', classification: 'Provisions', value: provisionValue, is_provision: true }]);
+        created++;
+      }
+      continue;
+    }
+
+    for (const devPkg of linked) {
+      const workItems: any[] = Array.isArray(devPkg.work_items) ? devPkg.work_items : [];
+      const allocated = sumItems(workItems, (i) => !i?.is_provision);
+      const provisionValue = Math.max(0, budget - allocated);
+      if (provisionValue <= 0) {
+        if (workItems.some((i) => i?.is_provision)) {
+          const cleaned = workItems.filter((i) => !i?.is_provision);
+          await updateWorkItems('development_package', devPkg.id, cleaned, sumItems(cleaned));
+        }
+        continue;
+      }
+      const hadProvision = workItems.some((i) => i?.is_provision);
+      const newItems = withProvision(workItems, provisionValue, 'PROV');
+      await updateWorkItems('development_package', devPkg.id, newItems, sumItems(newItems));
+      if (hadProvision) updated++; else created++;
+    }
+  }
+  return { success: true, message: `Auto Provision complete. ${created} created, ${updated} updated.`, created, updated };
+}
+
+// generateAutoProvisionDraft — preview the suggested provisions (no writes) for
+// work_packages | prelims | professional_fees.
+async function generateAutoProvisionDraft(args: Args): Promise<unknown> {
+  const developmentId = args.developmentId as string | undefined;
+  const type = args.type as string | undefined;
+  if (!developmentId || !type) return { error: 'developmentId and type required' };
+  const devR = await query<any>(`SELECT * FROM "development" WHERE id = $1 LIMIT 1`, [developmentId]);
+  if (!devR.rowCount) return { error: 'Development not found' };
+  const development = devR.rows[0];
+  const drafts: any[] = [];
+
+  if (type === 'work_packages') {
+    const wpR = await query<any>(`SELECT * FROM "work_package" WHERE development_id = $1`, [developmentId]);
+    for (const wp of wpR.rows) {
+      const budget = Number(wp.budget_cost) || 0;
+      if (budget === 0) continue;
+      const items: any[] = Array.isArray(wp.work_items) ? wp.work_items : [];
+      const projected = sumItems(items, (i) => !i?.is_provision);
+      const existing = Number(items.find((i) => i?.is_provision)?.value) || 0;
+      const suggested = Math.max(0, budget - projected);
+      if (suggested <= 0) continue;
+      drafts.push({ id: wp.id, type: 'work_package', reference: wp.reference || '', name: wp.description || wp.reference || 'Work Package', budget, projected_ex_provision: projected, existing_provision: existing, suggested_provision: suggested, prov_reference: `${development.development_code}-${wp.reference || 'WP'}-PROV01` });
+    }
+  } else if (type === 'prelims') {
+    const dpR = await query<any>(`SELECT * FROM "development_prelim" WHERE development_id = $1`, [developmentId]);
+    const ctR = await query<any>(`SELECT id, code FROM "prelim_cost_type" ORDER BY sort_order NULLS LAST`);
+    const cts = ctR.rows;
+    for (const prelim of dpR.rows) {
+      const budget = Number(prelim.budget_cost) || 0;
+      if (budget === 0) continue;
+      const items: any[] = Array.isArray(prelim.work_items) ? prelim.work_items : [];
+      const projected = sumItems(items, (i) => !i?.is_provision);
+      const existing = Number(items.find((i) => i?.is_provision)?.value) || 0;
+      const suggested = Math.max(0, budget - projected);
+      if (suggested <= 0) continue;
+      const ctIndex = cts.findIndex((c: any) => c.id === prelim.cost_type_id);
+      const ctCode = cts[ctIndex]?.code || (ctIndex >= 0 ? `PR${String(ctIndex + 1).padStart(2, '0')}` : 'PR');
+      drafts.push({ id: prelim.id, type: 'prelim', reference: prelim.cost_type_name || '', name: prelim.cost_type_name || 'Prelim', budget, projected_ex_provision: projected, existing_provision: existing, suggested_provision: suggested, cost_type_id: prelim.cost_type_id, prov_reference: `${development.development_code}-${ctCode}-PROV01` });
+    }
+  } else if (type === 'professional_fees') {
+    const dfR = await query<any>(`SELECT * FROM "development_professional_fee" WHERE development_id = $1`, [developmentId]);
+    const ftR = await query<any>(`SELECT id, code FROM "professional_fee_type" ORDER BY sort_order NULLS LAST`);
+    const fts = ftR.rows;
+    for (const devFee of dfR.rows) {
+      const budget = Number(devFee.budget_cost) || 0;
+      if (budget === 0) continue;
+      const items: any[] = Array.isArray(devFee.work_items) ? devFee.work_items : [];
+      const projected = sumItems(items, (i) => !i?.is_provision);
+      const existing = Number(items.find((i) => i?.is_provision)?.value) || 0;
+      const suggested = Math.max(0, budget - projected);
+      if (suggested <= 0) continue;
+      const ftIndex = fts.findIndex((f: any) => f.id === devFee.fee_type_id);
+      const ftCode = fts[ftIndex]?.code || (ftIndex >= 0 ? `PF${String(ftIndex + 1).padStart(2, '0')}` : 'PF');
+      drafts.push({ id: devFee.id, type: 'professional_fee', reference: devFee.fee_type_name || '', name: devFee.fee_type_name || 'Professional Fee', budget, projected_ex_provision: projected, existing_provision: existing, suggested_provision: suggested, fee_type_id: devFee.fee_type_id, prov_reference: `${development.development_code}-${ftCode}-PROV01` });
+    }
+  }
+  return { success: true, drafts };
+}
+
+// applyAutoProvisions — write the approved provision drafts back, with a BudgetAuditLog entry each.
+async function applyAutoProvisions(args: Args, user: AuthUser): Promise<unknown> {
+  const developmentId = args.developmentId as string | undefined;
+  const provisions = args.provisions as any[] | undefined;
+  if (!developmentId || !provisions?.length) return { error: 'developmentId and provisions required' };
+  const uR = await query<{ full_name: string | null }>(`SELECT full_name FROM "user" WHERE lower(email)=lower($1) LIMIT 1`, [user.email ?? '']);
+  const fullName = uR.rows[0]?.full_name || user.email;
+  const now = new Date().toISOString();
+  let applied = 0;
+
+  for (const prov of provisions) {
+    const newValue = Number(prov.suggested_provision) || 0;
+    const map: Record<string, { table: string; itemKey: string }> = {
+      work_package: { table: 'work_package', itemKey: 'id' },
+      prelim: { table: 'development_prelim', itemKey: 'cost_type_id' },
+      professional_fee: { table: 'development_professional_fee', itemKey: 'fee_type_id' },
+    };
+    const cfg = map[prov.type];
+    if (!cfg) continue;
+    const rR = await query<any>(`SELECT * FROM "${cfg.table}" WHERE id = $1 LIMIT 1`, [prov.id]);
+    if (!rR.rowCount) continue;
+    const rec = rR.rows[0];
+    const workItems: any[] = Array.isArray(rec.work_items) ? rec.work_items : [];
+    const fallbackRef = prov.type === 'work_package' ? `${rec.reference}-${String(workItems.length + 1).padStart(3, '0')}` : 'PROV';
+    const extra = prov.type === 'work_package' ? { cost_category: 'Subcontracted', allocated: false } : {};
+    const newItems = withProvision(workItems, newValue, prov.prov_reference || fallbackRef, extra);
+    await updateWorkItems(cfg.table, prov.id, newItems);
+    await insertRow('budget_audit_log', {
+      development_id: developmentId, item_type: prov.type, item_id: prov[cfg.itemKey] ?? prov.id, item_name: prov.name,
+      old_value: prov.existing_provision, new_value: newValue, reason: 'Auto Provision',
+      changed_by: user.email, changed_by_name: fullName, changed_at: now,
+    }, user);
+    applied++;
+  }
+  return { success: true, applied };
+}
+
+// importMeasuredWorks — import measured-work master items from Excel. Supports 'plot_based'
+// (per-plot qty/rate columns + optional Dev Wide) and flat mode (single qty/rate). NOTE:
+// the Base44 version also mirrored discovered categories into a generic AppConfig KV row;
+// our app_config table is typed (no config_value), so category persistence is skipped here
+// (returned under categoriesFound instead).
+async function importMeasuredWorks(args: Args, user: AuthUser): Promise<unknown> {
+  const file_url = args.file_url as string | undefined;
+  const development_id = args.development_id as string | undefined;
+  const mode = args.mode as string | undefined;
+  const as_template = args.as_template === true;
+  if (!file_url || !development_id) return { error: 'Missing file_url or development_id' };
+  const data = await readSheetRows(file_url);
+  const itemsToCreate: Record<string, unknown>[] = [];
+  const categoryMap: Record<string, Set<string>> = {};
+  const track = (cat: string, subcat: string) => { if (!cat) return; (categoryMap[cat] ||= new Set()); if (subcat) categoryMap[cat].add(subcat); };
+  const cell = (v: any) => (v != null ? String(v).trim() : '');
+
+  if (mode === 'plot_based') {
+    if (data.length < 2) return { error: 'File appears empty' };
+    const headerRow: any[] = data[0] || [];
+    const plotColumns: { qtyColIndex: number; rateColIndex: number | null; plotLabel: string }[] = [];
+    for (let c = 5; c < headerRow.length; c++) {
+      const header = headerRow[c] ? String(headerRow[c]).trim() : '';
+      if (!header) continue;
+      const hl = header.toLowerCase();
+      if (['dev wide qty', 'dev wide rate', 'dw qty', 'dw rate'].includes(hl)) continue;
+      const qtyMatch = header.match(/^(.+?)\s+qty$/i);
+      const rateMatch = header.match(/^(.+?)\s+rate$/i);
+      if (qtyMatch) {
+        const plotLabel = qtyMatch[1].trim();
+        const nextHeader = (headerRow[c + 1] || '').toString().trim();
+        const nextRateMatch = nextHeader.match(/^(.+?)\s+rate$/i);
+        if (nextRateMatch && nextRateMatch[1].trim().toLowerCase() === plotLabel.toLowerCase()) { plotColumns.push({ qtyColIndex: c, rateColIndex: c + 1, plotLabel }); c++; }
+        else plotColumns.push({ qtyColIndex: c, rateColIndex: null, plotLabel });
+      } else if (!rateMatch) {
+        plotColumns.push({ qtyColIndex: c, rateColIndex: null, plotLabel: header });
+      }
+    }
+    const plotsR = await query<any>(`SELECT id, plot_label, plot_number FROM "plot" WHERE development_id = $1`, [development_id]);
+    const plotByLabel: Record<string, any> = {};
+    for (const p of plotsR.rows) { if (p.plot_label) plotByLabel[String(p.plot_label).toLowerCase()] = p; plotByLabel[`plot ${p.plot_number}`] = p; }
+    let devWideQtyCol: number | null = null, devWideRateCol: number | null = null;
+    for (let c = 0; c < headerRow.length; c++) {
+      const h = (headerRow[c] || '').toString().trim().toLowerCase();
+      if (h === 'dev wide qty' || h === 'dw qty') devWideQtyCol = c;
+      if (h === 'dev wide rate' || h === 'dw rate') devWideRateCol = c;
+    }
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i]; if (!row) continue;
+      const catStr = cell(row[0]), subcatStr = cell(row[1]), referenceNumber = row[2] != null ? String(row[2]) : '';
+      const description = cell(row[3]), unit = cell(row[4]) || 'sum';
+      if (!description) continue;
+      track(catStr, subcatStr);
+      const base = { development_id, category: catStr, subcategory: subcatStr, reference_number: referenceNumber, name: description, unit, sort_order: i };
+      const devQty = devWideQtyCol !== null ? (parseFloat(row[devWideQtyCol]) || 0) : 0;
+      const devRate = devWideRateCol !== null ? (parseFloat(row[devWideRateCol]) || 0) : 0;
+      const hasDevWide = devQty > 0 || devRate > 0;
+      itemsToCreate.push({ ...base, plot_id: null, is_template: !hasDevWide, quantity: devQty, rate: devRate, total_value: devQty * devRate });
+      for (const { qtyColIndex, rateColIndex, plotLabel } of plotColumns) {
+        const plot = plotByLabel[plotLabel.toLowerCase()];
+        if (!plot) continue;
+        const qty = parseFloat(row[qtyColIndex]) || 0;
+        const rateValue = rateColIndex !== null ? (parseFloat(row[rateColIndex]) || 0) : 0;
+        if (qty === 0 && rateValue === 0) continue;
+        itemsToCreate.push({ ...base, plot_id: plot.id, is_template: false, quantity: qty, rate: rateValue, total_value: qty * rateValue });
+      }
+    }
+  } else {
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i]; if (!row) continue;
+      const catStr = cell(row[0]), subcatStr = cell(row[1]), referenceNumber = row[2] != null ? String(row[2]) : '';
+      const description = cell(row[3]), unit = cell(row[4]) || 'sum';
+      const qty = parseFloat(row[5]) || 0, rateValue = parseFloat(row[6]) || 0;
+      if (!description) continue;
+      track(catStr, subcatStr);
+      itemsToCreate.push({ development_id, plot_id: null, is_template: as_template, category: catStr, subcategory: subcatStr, reference_number: referenceNumber, name: description, unit, quantity: qty, rate: rateValue, total_value: qty * rateValue, sort_order: i });
+    }
+  }
+
+  for (const item of itemsToCreate) await insertRow('measured_work_master_item', item, user);
+  return { success: true, imported: itemsToCreate.length, categoriesFound: Object.keys(categoryMap), message: `Successfully imported ${itemsToCreate.length} measured work items` };
+}
+
+// generatePaymentPacks — admin: create a draft PaymentPack (+ a line per approved
+// subcontractor DevelopmentPackage) for each development, for the given/next period.
+async function generatePaymentPacks(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Admin access required' };
+  const development_id = args.development_id as string | undefined;
+  const customPeriod = args.period as string | undefined;
+  const devsR = await query<any>(`SELECT id, name FROM "development"`);
+  const pkgsR = await query<any>(`SELECT * FROM "development_package" WHERE status = 'active' AND approval_status = 'approved'`);
+  const subPkgs = pkgsR.rows.filter((p: any) => p.supplier_id && p.supplier_name);
+
+  let period = customPeriod;
+  if (!period) { const n = new Date(); n.setMonth(n.getMonth() + 1); period = `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}`; }
+
+  const byDev: Record<string, any[]> = {};
+  for (const pkg of subPkgs) (byDev[pkg.development_id] ||= []).push(pkg);
+  const targetIds = development_id ? [development_id] : Object.keys(byDev);
+  const created: string[] = [];
+  const now = new Date().toISOString();
+
+  for (const devId of targetIds) {
+    const dev = devsR.rows.find((d: any) => d.id === devId);
+    if (!dev) continue;
+    const exists = await query(`SELECT 1 FROM "payment_pack" WHERE development_id = $1 AND period = $2 LIMIT 1`, [devId, period]);
+    if (exists.rowCount) continue;
+    const pack = await insertRow('payment_pack', {
+      development_id: devId, development_name: dev.name, period, status: 'draft', generated_date: now, generated_by: user.email,
+      total_amount_claimed: 0, total_retention: 0, total_net_payable: 0,
+    }, user);
+    for (const pkg of byDev[devId] || []) {
+      const li = await query(`SELECT 1 FROM "payment_pack_line_item" WHERE payment_pack_id = $1 AND development_package_id = $2 LIMIT 1`, [pack.id, pkg.id]);
+      if (li.rowCount) continue;
+      await insertRow('payment_pack_line_item', {
+        payment_pack_id: pack.id, development_package_id: pkg.id, subcontractor_name: pkg.supplier_name, subcontractor_id: pkg.supplier_id,
+        package_name: pkg.package_category_name, total_contract_value: pkg.total_package_value || 0, amount_claimed_this_period: 0,
+        previously_claimed: 0, cumulative_claimed: 0, in_contract_retention_percentage: pkg.in_contract_retention_percentage || 0,
+        cumulative_retention: 0, net_total_payable: 0, invoice_status: 'pending', certification_status: 'pending',
+      }, user);
+    }
+    created.push(pack.id as string);
+  }
+  return { success: true, message: `Created ${created.length} payment pack(s) for period ${period}`, payment_pack_ids: created };
+}
+
+// --- Caller ID lookups (Phone screen) ---------------------------------------
+const digits = (s: unknown): string => String(s ?? '').replace(/\D/g, '');
+// lookupCaller — exact-match phone lookup across employees, suppliers, residents, owners.
+async function lookupCaller(args: Args): Promise<unknown> {
+  const phone_number = args.phone_number as string | undefined;
+  if (!phone_number) return { error: 'phone_number required' };
+  const n = digits(phone_number);
+  const emp = await query<any>(`SELECT id, first_name, last_name FROM "employee" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') = $1 LIMIT 1`, [n]);
+  if (emp.rowCount) return { id: emp.rows[0].id, type: 'Employee', name: `${emp.rows[0].first_name || ''} ${emp.rows[0].last_name || ''}`.trim() };
+  const sup = await query<any>(`SELECT id, company_name FROM "supplier" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') = $1 OR regexp_replace(coalesce(callout_phone,''),'\\D','','g') = $1 LIMIT 1`, [n]);
+  if (sup.rowCount) return { id: sup.rows[0].id, type: 'Supplier', name: sup.rows[0].company_name };
+  const res = await query<any>(`SELECT id, full_name FROM "resident" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') = $1 LIMIT 1`, [n]);
+  if (res.rowCount) return { id: res.rows[0].id, type: 'Resident', name: res.rows[0].full_name };
+  const own = await query<any>(`SELECT id, contact_person, company_name FROM "property_owner" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') = $1 LIMIT 1`, [n]);
+  if (own.rowCount) return { id: own.rows[0].id, type: 'PropertyOwner', name: own.rows[0].contact_person || own.rows[0].company_name };
+  return { match: null };
+}
+
+// searchCallerIdentity — partial (contains) phone match; returns a labelled caller or Unknown.
+async function searchCallerIdentity(args: Args): Promise<unknown> {
+  const phone_number = args.phone_number as string | undefined;
+  if (!phone_number) return { error: 'Phone number required' };
+  const n = digits(phone_number);
+  if (!n) return { id: null, type: null, name: 'Unknown Caller', phone: phone_number };
+  const like = `%${n}%`;
+  const emp = await query<any>(`SELECT id, first_name, last_name, job_role_name FROM "employee" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') LIKE $1 LIMIT 1`, [like]);
+  if (emp.rowCount) return { id: emp.rows[0].id, type: 'Employee', name: `${emp.rows[0].first_name || ''} ${emp.rows[0].last_name || ''}`.trim(), job_role_name: emp.rows[0].job_role_name, phone: phone_number };
+  const sup = await query<any>(`SELECT id, company_name FROM "supplier" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') LIKE $1 OR regexp_replace(coalesce(callout_phone,''),'\\D','','g') LIKE $1 LIMIT 1`, [like]);
+  if (sup.rowCount) return { id: sup.rows[0].id, type: 'Supplier', name: sup.rows[0].company_name, company_name: sup.rows[0].company_name, phone: phone_number };
+  const own = await query<any>(`SELECT id, contact_person, company_name FROM "property_owner" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') LIKE $1 LIMIT 1`, [like]);
+  if (own.rowCount) return { id: own.rows[0].id, type: 'PropertyOwner', name: own.rows[0].contact_person || own.rows[0].company_name, phone: phone_number };
+  const res = await query<any>(`SELECT id, full_name FROM "resident" WHERE regexp_replace(coalesce(phone,''),'\\D','','g') LIKE $1 LIMIT 1`, [like]);
+  if (res.rowCount) return { id: res.rows[0].id, type: 'Resident', name: res.rows[0].full_name, phone: phone_number };
+  return { id: null, type: null, name: 'Unknown Caller', phone: phone_number };
+}
+
+// deleteUserAccount — delete the signed-in user's own account record.
+async function deleteUserAccount(_args: Args, user: AuthUser): Promise<unknown> {
+  await query(`DELETE FROM "user" WHERE lower(email) = lower($1)`, [user.email ?? '']);
+  return { success: true, message: 'Account deleted successfully' };
+}
+
+// checkUserSuspension — is the signed-in user suspended?
+async function checkUserSuspension(_args: Args, user: AuthUser): Promise<unknown> {
+  const r = await query<{ is_suspended: boolean | null }>(`SELECT is_suspended FROM "user" WHERE lower(email) = lower($1) LIMIT 1`, [user.email ?? '']);
+  if (r.rows[0]?.is_suspended) return { suspended: true, message: 'Your access has been suspended. Please contact your administrator.' };
+  return { suspended: false };
+}
+
+// analyseProgrammeChange — AI picks the tasks directly affected by an instruction, then
+// dependency shifts cascade to successors in code (deterministic BFS).
+async function analyseProgrammeChange(args: Args): Promise<unknown> {
+  const tasks = args.tasks as any[] | undefined;
+  const instruction = args.instruction as string | undefined;
+  if (!tasks || !instruction) return { error: 'Missing tasks or instruction' };
+
+  const keywords = instruction.toLowerCase().match(/\b[\w]+\b/g) || [];
+  const filtered = tasks.filter((t) => { const nm = String(t.name || '').toLowerCase(); return keywords.some((kw) => nm.includes(kw)); });
+  const toAnalyze = filtered.length > 0 ? filtered : tasks;
+  const taskListText = toAnalyze.map((t) => `UID: ${t.uid} | Name: ${t.name} | Start: ${t.start || 'N/A'} | Finish: ${t.finish || 'N/A'}`).join('\n');
+  const prompt = `You are a construction programme assistant. Given the task list and a change instruction, identify ONLY the tasks that are DIRECTLY affected by the instruction (not their dependants - dependency cascading will be handled separately). For each directly affected task, return its UID and how many days to shift it (positive = delay, negative = bring forward).\n\nTASK LIST:\n${taskListText}\n\nCHANGE INSTRUCTION:\n${instruction}`;
+
+  const result: any = await invokeAI({
+    prompt,
+    response_json_schema: {
+      type: 'object',
+      properties: { changes: { type: 'array', items: { type: 'object', properties: { uid: { type: 'number' }, name: { type: 'string' }, shiftDays: { type: 'number' }, reason: { type: 'string' } } } } },
+    },
+  });
+  let directChanges: any[];
+  if (Array.isArray(result)) directChanges = result;
+  else if (result?.changes && Array.isArray(result.changes)) directChanges = result.changes;
+  else return { error: 'AI returned unexpected format. Please try again.' };
+  if (!directChanges.length) return { changes: [] };
+
+  const successorMap: Record<string, number[]> = {};
+  for (const t of tasks) for (const predUid of (t.predecessorUids || [])) (successorMap[predUid] ||= []).push(t.uid);
+  const taskByUid: Record<string, any> = {};
+  for (const t of tasks) taskByUid[t.uid] = t;
+
+  const shiftMap: Record<string, { shiftDays: number; reason: string }> = {};
+  for (const c of directChanges) shiftMap[c.uid] = { shiftDays: c.shiftDays, reason: c.reason };
+  const queue = directChanges.map((c) => ({ uid: c.uid, shiftDays: c.shiftDays }));
+  const visited = new Set<string>();
+  while (queue.length > 0) {
+    const { uid, shiftDays } = queue.shift()!;
+    const key = `${uid}-${shiftDays}`;
+    if (visited.has(key)) continue;
+    visited.add(key);
+    for (const succUid of (successorMap[uid] || [])) {
+      const existing = shiftMap[succUid];
+      if (!existing || Math.abs(shiftDays) > Math.abs(existing.shiftDays)) {
+        shiftMap[succUid] = { shiftDays, reason: `Cascaded from "${taskByUid[uid]?.name || uid}" (${shiftDays > 0 ? '+' : ''}${shiftDays} days)` };
+        queue.push({ uid: succUid, shiftDays });
+      }
+    }
+  }
+  const changes = Object.entries(shiftMap).map(([uid, { shiftDays, reason }]) => ({ uid: parseInt(uid, 10), name: taskByUid[uid]?.name || `Task ${uid}`, shiftDays, reason }));
+  return { changes };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -832,6 +1231,16 @@ const handlers: Record<string, Handler> = {
   importProfessionalFees: (args, user) => importProfessionalFees(args, user),
   deleteMyAccount: (args, user) => deleteMyAccount(args, user),
   approveApiToken: (args, user) => approveApiToken(args, user),
+  autoProvisionWorkPackages: (args, user) => autoProvisionWorkPackages(args, user),
+  generateAutoProvisionDraft: (args) => generateAutoProvisionDraft(args),
+  applyAutoProvisions: (args, user) => applyAutoProvisions(args, user),
+  importMeasuredWorks: (args, user) => importMeasuredWorks(args, user),
+  generatePaymentPacks: (args, user) => generatePaymentPacks(args, user),
+  lookupCaller: (args) => lookupCaller(args),
+  searchCallerIdentity: (args) => searchCallerIdentity(args),
+  deleteUserAccount: (args, user) => deleteUserAccount(args, user),
+  checkUserSuspension: (args, user) => checkUserSuspension(args, user),
+  analyseProgrammeChange: (args) => analyseProgrammeChange(args),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

@@ -424,6 +424,62 @@ async function undeliverPOLineItems(args: Args, user: AuthUser): Promise<unknown
   return { success: true, message: `${valid.length} line item(s) undelivered`, po_id, undelivered_count: valid.length };
 }
 
+// updateJ5UserCell — admin: assign a user's Johnny5 cell.
+async function updateJ5UserCell(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Forbidden' };
+  const userId = args.userId as string | undefined;
+  if (!userId) return { error: 'userId required' };
+  await query(`UPDATE "user" SET johnny5_cell_id = $1, johnny5_cell_name = $2, updated_date = $3 WHERE id = $4`,
+    [(args.johnny5_cell_id ?? null) as unknown, (args.johnny5_cell_name ?? null) as unknown, new Date().toISOString(), userId]);
+  return { success: true };
+}
+
+// reclassifyInvoiceToSubcontractor — move a supply-chain PO to subcontractor and add it
+// to the development's payment pack for the invoice period (creating the pack if needed).
+async function reclassifyInvoiceToSubcontractor(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') {
+    const u = await query<{ can_match_invoice: boolean | null }>(`SELECT can_match_invoice FROM "user" WHERE lower(email) = lower($1) LIMIT 1`, [user.email ?? '']);
+    if (!u.rows[0]?.can_match_invoice) return { error: 'Forbidden: ProcureIT Admin access required' };
+  }
+  const po_id = args.po_id as string | undefined;
+  const development_package_id = args.development_package_id as string | undefined;
+  if (!po_id || !development_package_id) return { error: 'Missing po_id or development_package_id' };
+
+  const poR = await query<any>(`SELECT * FROM "purchase_order" WHERE id = $1 LIMIT 1`, [po_id]);
+  if (!poR.rowCount) return { error: 'PO not found' };
+  const po = poR.rows[0];
+  if (po.invoice_type !== 'supply_chain') return { error: 'PO is not a supply chain invoice' };
+
+  const dpR = await query<any>(`SELECT * FROM "development_package" WHERE id = $1 LIMIT 1`, [development_package_id]);
+  if (!dpR.rowCount) return { error: 'Development package not found' };
+  const dp = dpR.rows[0];
+  const dpRef = dp.package_reference || dp.package_category_name || '';
+  const dpName = dp.package_category_name || dp.package_reference || '';
+  const now = new Date().toISOString();
+
+  await query(`UPDATE "purchase_order" SET invoice_type='subcontractor', subcontractor_development_package_id=$1, subcontractor_development_package_reference=$2, updated_date=$3 WHERE id=$4`,
+    [development_package_id, dpRef, now, po_id]);
+
+  const invDate = new Date(po.invoice_date || now);
+  const period = `${invDate.getUTCFullYear()}-${String(invDate.getUTCMonth() + 1).padStart(2, '0')}`;
+  const ppR = await query<any>(`SELECT * FROM "payment_pack" WHERE development_id = $1 AND period = $2 LIMIT 1`, [po.development_id, period]);
+  const pp = ppR.rowCount
+    ? ppR.rows[0]
+    : await insertRow('payment_pack', {
+        development_id: po.development_id, development_name: po.development_name, period, status: 'draft',
+        generated_by: user.email, generated_date: now, total_amount_claimed: 0, total_retention: 0, total_net_payable: 0,
+      }, user);
+
+  const li = await insertRow('payment_pack_line_item', {
+    payment_pack_id: pp.id, purchase_order_id: po_id, subcontractor_name: po.supplier_name, subcontractor_id: po.supplier_id,
+    purchase_order_number: po.po_number, development_package_id, package_name: dpName,
+    total_contract_value: po.total_value, amount_claimed_this_period: po.invoiced_value || 0, cumulative_claimed: po.invoiced_value || 0,
+    certification_status: 'pending', invoice_status: 'pending', xero_sync_status: 'pending',
+  }, user);
+
+  return { success: true, message: 'Invoice reclassified to subcontractor and added to payment pack', po_id, payment_pack_id: pp.id, line_item_id: li.id };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -435,6 +491,8 @@ const handlers: Record<string, Handler> = {
   createDevelopment: (args, user) => createDevelopment(args, user),
   syncHSECorrectiveActionsToGSD: (args, user) => syncHSECorrectiveActionsToGSD(args, user),
   undeliverPOLineItems: (args, user) => undeliverPOLineItems(args, user),
+  updateJ5UserCell: (args, user) => updateJ5UserCell(args, user),
+  reclassifyInvoiceToSubcontractor: (args, user) => reclassifyInvoiceToSubcontractor(args, user),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

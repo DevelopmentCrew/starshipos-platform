@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import crypto from 'node:crypto';
+import * as XLSX from 'xlsx';
 import { query } from '../db.js';
 import { authenticate, type AuthUser } from '../auth.js';
 import { invokeAI } from '../ai.js';
@@ -685,6 +686,129 @@ async function instantiatePlotMeasuredWorks(args: Args, user: AuthUser): Promise
   return { success: true, created: totalCreated, message: `Created ${totalCreated} measured work items across ${plotsToProcess.length} plot(s)` };
 }
 
+// deleteMyAccount — delete the signed-in user's own account record (login/profile only).
+async function deleteMyAccount(_args: Args, user: AuthUser): Promise<unknown> {
+  await query(`DELETE FROM "user" WHERE lower(email) = lower($1)`, [user.email ?? '']);
+  return { success: true };
+}
+
+// approveApiToken — admin: approve (mints a token), reject, or revoke an API token request.
+async function approveApiToken(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Admin access required' };
+  const token_id = args.token_id as string | undefined;
+  const action = args.action as string | undefined;
+  if (!token_id || !action) return { error: 'token_id and action are required' };
+  if (!['approve', 'reject', 'revoke'].includes(action)) return { error: 'action must be approve, reject, or revoke' };
+  const rec = await query<any>(`SELECT * FROM "api_token" WHERE id = $1 LIMIT 1`, [token_id]);
+  if (!rec.rowCount) return { error: 'Token request not found' };
+  const now = new Date().toISOString();
+  const updates: Record<string, unknown> = { notes: (args.notes as string) ?? rec.rows[0].notes, updated_date: now };
+  let generatedToken: string | null = null;
+  if (action === 'approve') {
+    generatedToken = 'ssg_' + crypto.randomBytes(32).toString('hex');
+    updates.status = 'approved'; updates.token = generatedToken; updates.approved_by = user.email; updates.approved_date = now;
+  } else if (action === 'reject') {
+    updates.status = 'rejected';
+  } else {
+    updates.status = 'revoked'; updates.token = null;
+  }
+  const keys = Object.keys(updates);
+  await query(`UPDATE "api_token" SET ${keys.map((k, i) => `"${k}"=$${i + 1}`).join(', ')} WHERE id=$${keys.length + 1}`, [...keys.map((k) => updates[k]), token_id]);
+  return { success: true, message: `Token ${action}d successfully`, ...(generatedToken ? { token: generatedToken } : {}) };
+}
+
+// Read the first sheet of an Excel file (by URL) into an array of row-arrays.
+async function readSheetRows(file_url: string): Promise<any[][]> {
+  const res = await fetch(file_url);
+  if (!res.ok) throw new Error(`Failed to fetch file: ${res.status}`);
+  const wb = XLSX.read(Buffer.from(await res.arrayBuffer()), { type: 'buffer' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(ws, { header: 1 }) as any[][];
+}
+
+// importPrelims — load prelim cost items from an Excel file (ref, heading, description, qty, unit, rate).
+async function importPrelims(args: Args, user: AuthUser): Promise<unknown> {
+  const file_url = args.file_url as string | undefined;
+  const development_id = args.development_id as string | undefined;
+  if (!file_url || !development_id) return { error: 'Missing file_url or development_id' };
+  const data = await readSheetRows(file_url);
+  const devR = await query<{ development_code: string | null }>(`SELECT development_code FROM "development" WHERE id=$1 LIMIT 1`, [development_id]);
+  const devCode = devR.rows[0]?.development_code || '000';
+  const hR = await query<{ id: string; name: string | null }>(`SELECT id, name FROM "prelim_heading" ORDER BY sort_order`);
+  const headingMap = new Map<string, string>();
+  for (const h of hR.rows) headingMap.set((h.name || '').toUpperCase(), h.id);
+  const getHeading = async (nm: string | null): Promise<string | null> => {
+    if (!nm) return null;
+    const key = nm.toUpperCase();
+    if (headingMap.has(key)) return headingMap.get(key)!;
+    const created = await insertRow('prelim_heading', { name: nm, sort_order: headingMap.size + 1 }, user);
+    headingMap.set(key, created.id as string);
+    return created.id as string;
+  };
+  const serialToMonthYear = (serial: number) => new Date(Math.round((serial - 25569) * 86400 * 1000)).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' });
+  let counter = 1, imported = 0;
+  const failures: any[] = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row || row.length === 0) continue;
+    const reference_number = row[0] != null ? String(row[0]).trim() : '';
+    const headingName = row[1] != null ? String(row[1]).trim() : '';
+    const rawName = row[2] != null ? String(row[2]).trim() : '';
+    const quantity = parseFloat(row[3]) || 0;
+    const unit = row[4] != null ? String(row[4]).trim() || 'item' : 'item';
+    const rate = parseFloat(row[5]) || 0;
+    const total = quantity * rate;
+    const numericVal = parseFloat(rawName);
+    const name = !isNaN(numericVal) && /^\d+$/.test(rawName) && numericVal > 40000 ? serialToMonthYear(numericVal) : rawName;
+    if (!name || !rate) continue;
+    const heading_id = await getHeading(headingName || null);
+    try {
+      await insertRow('prelim_cost_item', { development_id, reference_number: reference_number || `${devCode}-PFS-${String(counter).padStart(2, '0')}`, name, unit, quantity, rate, total, prelim_heading_id: heading_id, sort_order: i }, user);
+      imported++;
+    } catch (e: any) { failures.push({ reference: reference_number || '—', name, reason: e.message || 'Unknown error' }); }
+    counter++;
+  }
+  return { success: true, imported, failed: failures.length, failures, message: `Imported ${imported} prelim item(s)${failures.length > 0 ? `, ${failures.length} failed` : ''}` };
+}
+
+// importProfessionalFees — load professional fee items from an Excel file (ref, description, fee type, unit, qty, rate).
+async function importProfessionalFees(args: Args, user: AuthUser): Promise<unknown> {
+  const file_url = args.file_url as string | undefined;
+  const development_id = args.development_id as string | undefined;
+  if (!file_url || !development_id) return { error: 'Missing file_url or development_id' };
+  const data = await readSheetRows(file_url);
+  const ftR = await query<{ id: string; name: string | null }>(`SELECT id, name FROM "professional_fee_type" WHERE development_id=$1 ORDER BY sort_order`, [development_id]);
+  const typeMap = new Map<string, string>();
+  for (const ft of ftR.rows) typeMap.set((ft.name || '').toUpperCase(), ft.id);
+  const getType = async (nm: string | null): Promise<string | null> => {
+    if (!nm) return null;
+    const key = nm.toUpperCase();
+    if (typeMap.has(key)) return typeMap.get(key)!;
+    const created = await insertRow('professional_fee_type', { name: nm, development_id, sort_order: typeMap.size + 1 }, user);
+    typeMap.set(key, created.id as string);
+    return created.id as string;
+  };
+  let imported = 0;
+  const failures: any[] = [];
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row || row.length === 0) continue;
+    const name = row[1] != null ? String(row[1]).trim() : '';
+    const feeTypeName = row[2] != null ? String(row[2]).trim() : '';
+    const unit = row[3] != null ? String(row[3]).trim() || 'sum' : 'sum';
+    const quantity = parseFloat(row[4]) || 1;
+    const rate = parseFloat(row[5]) || 0;
+    const total = quantity * rate;
+    if (!name || !rate) continue;
+    const fee_type_id = await getType(feeTypeName || null);
+    try {
+      await insertRow('professional_fee_item', { development_id, name, unit, quantity, rate, total, professional_fee_type_id: fee_type_id, sort_order: i }, user);
+      imported++;
+    } catch (e: any) { failures.push({ name, reason: e.message || 'Unknown error' }); }
+  }
+  return { success: true, imported, failed: failures.length, failures, message: `Imported ${imported} item(s)${failures.length > 0 ? `, ${failures.length} failed` : ''}` };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -704,6 +828,10 @@ const handlers: Record<string, Handler> = {
   populateTimesheetFromSignIns: (args) => populateTimesheetFromSignIns(args),
   autoCreateCVRPackages: (args, user) => autoCreateCVRPackages(args, user),
   instantiatePlotMeasuredWorks: (args, user) => instantiatePlotMeasuredWorks(args, user),
+  importPrelims: (args, user) => importPrelims(args, user),
+  importProfessionalFees: (args, user) => importProfessionalFees(args, user),
+  deleteMyAccount: (args, user) => deleteMyAccount(args, user),
+  approveApiToken: (args, user) => approveApiToken(args, user),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

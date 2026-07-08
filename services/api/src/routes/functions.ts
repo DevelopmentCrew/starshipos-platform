@@ -1,7 +1,43 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import crypto from 'node:crypto';
 import { query } from '../db.js';
 import { authenticate, type AuthUser } from '../auth.js';
 import { invokeAI } from '../ai.js';
+
+const newId = (): string => crypto.randomBytes(12).toString('hex');
+const SYSCOLS = ['id', 'created_date', 'updated_date', 'created_by', 'created_by_id'];
+
+const _colCache = new Map<string, Set<string>>();
+async function tableCols(table: string): Promise<Set<string>> {
+  const hit = _colCache.get(table);
+  if (hit) return hit;
+  const r = await query<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`,
+    [table],
+  );
+  const s = new Set(r.rows.map((x) => x.column_name));
+  _colCache.set(table, s);
+  return s;
+}
+
+// Insert `data` into `table`, keeping only real columns; adds id + system cols. Returns the row.
+async function insertRow(table: string, data: Record<string, unknown>, user: AuthUser): Promise<Record<string, unknown>> {
+  const cols = await tableCols(table);
+  const now = new Date().toISOString();
+  const rec: Record<string, unknown> = {
+    ...data, id: newId(), created_date: now, updated_date: now, created_by: user.email, created_by_id: user.sub,
+  };
+  const keys = Object.keys(rec).filter((k) => cols.has(k));
+  const vals = keys.map((k) => {
+    const v = rec[k];
+    return v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+  });
+  const r = await query(
+    `INSERT INTO "${table}" (${keys.map((k) => `"${k}"`).join(', ')}) VALUES (${keys.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`,
+    vals,
+  );
+  return r.rows[0] as Record<string, unknown>;
+}
 
 /**
  * Backend functions dispatcher — the port of base44.functions.invoke(name, args).
@@ -250,6 +286,144 @@ async function reassignTransactionDevelopment(args: Args, user: AuthUser): Promi
   return { message: `Reassigned transaction "${txn.rows[0].reference}" from ${txn.rows[0].development_name || 'unknown'} to ${dev.rows[0].name}`, transaction: transactionId };
 }
 
+// createDevelopment — allocate the next development code, create the Development,
+// and its default CheckMate GSD log. (Xero tracking-category sync is deferred until
+// the Xero module is ported; returns xero_results: [] for now.)
+async function createDevelopment(args: Args, user: AuthUser): Promise<unknown> {
+  const developmentData = args.developmentData as Record<string, unknown> | undefined;
+  if (!developmentData) return { error: 'developmentData is required' };
+  const now = new Date().toISOString();
+
+  let code: number;
+  const c = await query<{ id: string; value: number }>(`SELECT id, value FROM "app_counter" WHERE key = 'next_development_code' LIMIT 1`);
+  if (c.rowCount === 0) {
+    code = 200;
+    await query(`INSERT INTO "app_counter" (id, key, value, created_date, updated_date) VALUES ($1, 'next_development_code', 201, $2, $2)`, [newId(), now]);
+  } else {
+    code = Number(c.rows[0].value);
+    await query(`UPDATE "app_counter" SET value = $1, updated_date = $2 WHERE id = $3`, [code + 1, now, c.rows[0].id]);
+  }
+
+  const newDev = await insertRow('development', { ...developmentData, development_code: String(code) }, user);
+  await insertRow('gsd_action_log', {
+    development_id: newDev.id, development_name: newDev.name,
+    name: 'CheckMate', description: 'Auto-generated log for CheckMate checksheet failures',
+  }, user);
+
+  return { success: true, development: newDev, development_code: String(code), xero_results: [] };
+}
+
+// syncHSECorrectiveActionsToGSD — mirror an incident report's corrective actions into
+// the development's Project GSD log (create/update, deduped by report id + action index).
+async function getProjectGSDLog(developmentId: string, developmentName: string, user: AuthUser): Promise<{ id: string; name: string }> {
+  const logs = await query<{ id: string; name: string; log_type: string | null }>(
+    `SELECT id, name, log_type FROM "gsd_action_log" WHERE development_id = $1`, [developmentId]);
+  const pl = logs.rows.find((l) => l.log_type === 'project') || logs.rows.find((l) => l.name === 'Project GSD');
+  if (pl) return { id: pl.id, name: pl.name };
+  const created = await insertRow('gsd_action_log', {
+    development_id: developmentId, development_name: developmentName, name: 'Project GSD',
+    log_type: 'project', description: 'Running project action log',
+  }, user);
+  return { id: created.id as string, name: created.name as string };
+}
+
+async function syncOneReport(report: Record<string, any>, user: AuthUser): Promise<{ synced: number; skipped: number }> {
+  const actions: any[] = Array.isArray(report.corrective_actions) ? report.corrective_actions : [];
+  if (actions.length === 0) return { synced: 0, skipped: 0 };
+  const projectLog = await getProjectGSDLog(report.development_id, report.development_name || '', user);
+  const existing = await query<any>(`SELECT * FROM "gsd_log" WHERE source_incident_report_id = $1`, [report.id]);
+  const today = new Date().toISOString().split('T')[0];
+  let synced = 0, skipped = 0;
+  for (let i = 0; i < actions.length; i++) {
+    const ca = actions[i];
+    if (!ca?.action || !String(ca.action).trim()) { skipped++; continue; }
+    const ex = existing.rows.find((e: any) => e.source_corrective_action_index === i);
+    const reportLabel = `${report.report_type || 'HSE'} Report ${report.reference || report.id}`;
+    const status = ca.status === 'complete' || ca.completed_date ? 'Closed' : 'In Progress';
+    const owner = ca.owner || ca.assigned_to_name || '';
+    const payload = {
+      development_id: report.development_id, development_name: report.development_name || '',
+      action_log_id: projectLog.id, action_log_name: projectLog.name,
+      category: 'Manual', project_category: 'Safety', topic_area: reportLabel,
+      summary: `${reportLabel}: ${ca.action}`, action_decision: ca.action, owner,
+      assigned_to_employee_id: ca.assigned_to_employee_id ?? null,
+      assigned_to_name: ca.assigned_to_name || ca.owner || null,
+      target_date: ca.due_date ?? null, status, last_updated: today,
+      source_incident_report_id: report.id, source_corrective_action_index: i,
+    };
+    if (ex) {
+      const changed = ex.action_decision !== payload.action_decision || ex.owner !== payload.owner ||
+        ex.assigned_to_employee_id !== payload.assigned_to_employee_id || ex.target_date !== payload.target_date || ex.status !== payload.status;
+      if (changed) {
+        await query(
+          `UPDATE "gsd_log" SET action_decision=$1, summary=$2, owner=$3, assigned_to_employee_id=$4, assigned_to_name=$5, target_date=$6, status=$7, last_updated=$8, updated_date=$9 WHERE id=$10`,
+          [payload.action_decision, payload.summary, payload.owner, payload.assigned_to_employee_id, payload.assigned_to_name, payload.target_date, payload.status, new Date().toISOString(), ex.id],
+        );
+        synced++;
+      } else skipped++;
+    } else {
+      await insertRow('gsd_log', payload, user);
+      synced++;
+    }
+  }
+  return { synced, skipped };
+}
+
+async function syncHSECorrectiveActionsToGSD(args: Args, user: AuthUser): Promise<unknown> {
+  if (args.report_id) {
+    const r = await query<any>(`SELECT * FROM "incident_report" WHERE id = $1 LIMIT 1`, [args.report_id]);
+    if (!r.rowCount) return { error: 'Report not found' };
+    return { success: true, ...(await syncOneReport(r.rows[0], user)) };
+  }
+  if (user.role !== 'admin') return { error: 'Admin only for backfill' };
+  const reports = await query<any>(`SELECT * FROM "incident_report"`);
+  const withActions = reports.rows.filter((r: any) => Array.isArray(r.corrective_actions) && r.corrective_actions.length > 0 && r.development_id);
+  let total_synced = 0, total_skipped = 0;
+  const results: unknown[] = [];
+  for (const rep of withActions) {
+    const res = await syncOneReport(rep, user);
+    total_synced += res.synced; total_skipped += res.skipped;
+    results.push({ report: rep.reference || rep.id, ...res });
+  }
+  return { success: true, total_reports: withActions.length, total_synced, total_skipped, results };
+}
+
+// undeliverPOLineItems — reverse delivery on a PO (full, or selected line indices).
+async function undeliverPOLineItems(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') {
+    const u = await query<{ can_match_invoice: boolean | null }>(`SELECT can_match_invoice FROM "user" WHERE lower(email) = lower($1) LIMIT 1`, [user.email ?? '']);
+    if (!u.rows[0]?.can_match_invoice) return { error: 'Forbidden: ProcureIT Admin access required' };
+  }
+  const po_id = args.po_id as string | undefined;
+  const indices = args.line_item_indices as number[] | undefined;
+  if (!po_id) return { error: 'po_id is required' };
+  const po = await query<any>(`SELECT * FROM "purchase_order" WHERE id = $1 LIMIT 1`, [po_id]);
+  if (!po.rowCount) return { error: 'PO not found' };
+  const poRow = po.rows[0];
+  const mi = await query(`SELECT 1 FROM "purchase_invoice" WHERE purchase_order_id = $1 LIMIT 1`, [po_id]);
+  if (mi.rowCount) return { error: 'Cannot undeliver PO with matched invoices' };
+  const now = new Date().toISOString();
+
+  if (!indices || indices.length === 0) {
+    const li = await query<{ id: string }>(`SELECT id FROM "purchase_order_line_item" WHERE purchase_order_id = $1`, [po_id]);
+    for (const it of li.rows) {
+      await query(`UPDATE "purchase_order_line_item" SET quantity_delivered=0, delivered_value=0, quantity_to_stock=0, updated_date=$1 WHERE id=$2`, [now, it.id]);
+    }
+    await query(
+      `UPDATE "purchase_order" SET status='po_raised', delivered_value=0, outstanding_value=$1, invoice_matched_date=NULL, xero_sync_status='pending', updated_date=$2 WHERE id=$3`,
+      [Number(poRow.total_value) || 0, now, po_id],
+    );
+    return { success: true, message: 'PO fully undelivered', po_id, line_items_reset: li.rowCount };
+  }
+  const items: any[] = Array.isArray(poRow.extracted_line_items) ? poRow.extracted_line_items : [];
+  const valid = indices.filter((i) => i >= 0 && i < items.length);
+  if (valid.length === 0) return { error: 'Invalid line item indices' };
+  const updated = items.map((it, idx) => (valid.includes(idx) ? { ...it, _undelivered: true } : it));
+  const totalDelivered = updated.filter((_, idx) => !valid.includes(idx)).reduce((s, it) => s + (Number(it.total_value) || 0), 0);
+  await query(`UPDATE "purchase_order" SET extracted_line_items=$1, delivered_value=$2, xero_sync_status='pending', updated_date=$3 WHERE id=$4`, [JSON.stringify(updated), totalDelivered, now, po_id]);
+  return { success: true, message: `${valid.length} line item(s) undelivered`, po_id, undelivered_count: valid.length };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -258,6 +432,9 @@ const handlers: Record<string, Handler> = {
   generateIncidentReference: (args) => generateIncidentReference(args),
   checkCategoryTransactions: (args) => checkCategoryTransactions(args),
   reassignTransactionDevelopment: (args, user) => reassignTransactionDevelopment(args, user),
+  createDevelopment: (args, user) => createDevelopment(args, user),
+  syncHSECorrectiveActionsToGSD: (args, user) => syncHSECorrectiveActionsToGSD(args, user),
+  undeliverPOLineItems: (args, user) => undeliverPOLineItems(args, user),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

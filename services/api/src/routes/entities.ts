@@ -17,18 +17,25 @@ import { scopeFor, canWrite } from '../policy.js';
  */
 
 let schema: Map<string, Set<string>> | null = null;
+let schemaTypes: Map<string, Map<string, string>> | null = null;
 async function loadSchema(): Promise<Map<string, Set<string>>> {
   if (schema) return schema;
-  const r = await query<{ table_name: string; column_name: string }>(
-    `SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'`,
+  const r = await query<{ table_name: string; column_name: string; data_type: string }>(
+    `SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'`,
   );
   const m = new Map<string, Set<string>>();
+  const t = new Map<string, Map<string, string>>();
   for (const row of r.rows) {
-    if (!m.has(row.table_name)) m.set(row.table_name, new Set());
+    if (!m.has(row.table_name)) { m.set(row.table_name, new Set()); t.set(row.table_name, new Map()); }
     m.get(row.table_name)!.add(row.column_name);
+    t.get(row.table_name)!.set(row.column_name, row.data_type);
   }
   schema = m;
+  schemaTypes = t;
   return m;
+}
+function colTypesFor(table: string): Map<string, string> {
+  return schemaTypes?.get(table) ?? new Map();
 }
 
 const SYSTEM_COLS = new Set(['id', 'created_date', 'updated_date', 'created_by', 'created_by_id']);
@@ -49,14 +56,24 @@ function orderBy(sort: string, cols: Set<string>): string {
 
 const newId = (): string => crypto.randomBytes(12).toString('hex');
 
-function pickColumns(body: Record<string, unknown>, cols: Set<string>): { keys: string[]; values: unknown[] } {
+// Text-ish column types that legitimately accept an empty string.
+const TEXT_TYPES = new Set(['text', 'character varying', 'character', 'uuid', 'name', 'citext']);
+
+// Coerce a value for its column: '' -> NULL for non-text columns (dates, numbers,
+// booleans, jsonb — Postgres rejects '' there), and objects/arrays -> JSON for jsonb.
+function coerceValue(v: unknown, dataType: string | undefined): unknown {
+  if (v === '' && dataType && !TEXT_TYPES.has(dataType)) return null;
+  if (v !== null && typeof v === 'object') return JSON.stringify(v);
+  return v;
+}
+
+function pickColumns(body: Record<string, unknown>, cols: Set<string>, types: Map<string, string>): { keys: string[]; values: unknown[] } {
   const keys: string[] = [];
   const values: unknown[] = [];
   for (const k of Object.keys(body)) {
     if (!cols.has(k) || SYSTEM_COLS.has(k)) continue;
     keys.push(k);
-    const v = body[k];
-    values.push(v !== null && typeof v === 'object' ? JSON.stringify(v) : v);
+    values.push(coerceValue(body[k], types.get(k)));
   }
   return { keys, values };
 }
@@ -136,7 +153,7 @@ export async function entityRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(403).send({ error: 'not_authorised_to_create' });
     }
 
-    const { keys, values } = pickColumns(body, cols);
+    const { keys, values } = pickColumns(body, cols, colTypesFor(table));
     const now = new Date().toISOString();
     const sysVals: Record<string, unknown> = { id, created_date: now, updated_date: now, created_by: user.email, created_by_id: user.sub };
     const sysKeys = Object.keys(sysVals).filter((k) => cols.has(k));
@@ -162,7 +179,7 @@ export async function entityRoutes(app: FastifyInstance): Promise<void> {
     if (seen.rowCount === 0) return reply.code(404).send({ error: 'not_found' });
 
     const body = (req.body ?? {}) as Record<string, unknown>;
-    const { keys, values } = pickColumns(body, cols);
+    const { keys, values } = pickColumns(body, cols, colTypesFor(table));
     if (cols.has('updated_date')) { keys.push('updated_date'); values.push(new Date().toISOString()); }
     if (keys.length === 0) return reply.code(400).send({ error: 'nothing_to_update' });
     const setClause = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ');

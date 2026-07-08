@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import crypto from 'node:crypto';
 import * as XLSX from 'xlsx';
+import { jsPDF } from 'jspdf';
 import { query } from '../db.js';
 import { authenticate, type AuthUser } from '../auth.js';
 import { invokeAI } from '../ai.js';
@@ -1208,6 +1209,266 @@ async function analyseProgrammeChange(args: Args): Promise<unknown> {
   return { changes };
 }
 
+// generateTimesheetExcel — build a tab-separated payroll timesheet (CSV/Excel-compatible)
+// and return it as a string for the client to download. (Base44 returned the same shape.)
+async function generateTimesheetExcel(args: Args): Promise<unknown> {
+  const timesheet_id = args.timesheet_id as string | undefined;
+  if (!timesheet_id) return { error: 'Missing timesheet_id' };
+  const tsR = await query<any>(`SELECT * FROM "timesheet" WHERE id = $1 LIMIT 1`, [timesheet_id]);
+  const timesheet = tsR.rows[0];
+  if (!timesheet) return { error: 'Timesheet not found' };
+  const entriesR = await query<any>(`SELECT * FROM "timesheet_entry" WHERE timesheet_id = $1`, [timesheet_id]);
+  const devR = await query<any>(`SELECT company_name, name FROM "development" WHERE id = $1 LIMIT 1`, [timesheet.development_id]);
+  const development = devR.rows[0];
+
+  const num = (v: unknown) => Number(v) || 0;
+  const headers = ['Employee', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun', 'H', 'BH', 'AA', 'A', 'S', 'Total Hours'];
+  const rows = entriesR.rows.map((e: any) => [
+    e.employee_name,
+    num(e.monday_hours), num(e.tuesday_hours), num(e.wednesday_hours), num(e.thursday_hours),
+    num(e.friday_hours), num(e.saturday_hours), num(e.sunday_hours),
+    num(e.holiday_hours), num(e.bank_holiday_hours), num(e.authorised_absence_hours), num(e.unauthorised_absence_hours), num(e.sick_hours),
+    num(e.monday_hours) + num(e.tuesday_hours) + num(e.wednesday_hours) + num(e.thursday_hours) + num(e.friday_hours) + num(e.saturday_hours) + num(e.sunday_hours),
+  ]);
+  const headerRow = headers.join('\t');
+  const bodyRows = rows.map((r: any[]) => r.join('\t')).join('\n');
+  const csv = `STARSHIP GROUP - PAYROLL TIMESHEET\n\nCOMPANY: ${development?.company_name || ''}\nDevelopment: ${development?.name || ''}\nWeek Ending: ${timesheet.week_ending_date}\nPeriod: ${timesheet.period || ''}\nProcess Date: ${timesheet.process_date || ''}\nSubmitted: ${timesheet.submitted_date || ''}\n\n${headerRow}\n${bodyRows}`;
+  return { success: true, data: csv, filename: `Timesheet_${timesheet.development_name}_${timesheet.week_ending_date}.csv` };
+}
+
+// generatePaymentCertificate — build an A4 Certificate of Payment PDF from a certified
+// payment_pack_line_item and return it as a base64 data URI (the client uploads it).
+function numberToWords(amount: number): string {
+  const ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];
+  const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
+  const pounds = Math.floor(amount);
+  const pence = Math.round((amount - pounds) * 100);
+  const convertHundreds = (n: number): string => {
+    if (n === 0) return '';
+    let r = '';
+    if (n >= 100) { r += ones[Math.floor(n / 100)] + ' Hundred '; n %= 100; }
+    if (n >= 20) { r += tens[Math.floor(n / 10)] + ' '; n %= 10; }
+    if (n > 0) r += ones[n] + ' ';
+    return r;
+  };
+  const convert = (n: number): string => {
+    if (n === 0) return 'Zero';
+    let r = '';
+    if (n >= 1000000) { r += convertHundreds(Math.floor(n / 1000000)) + 'Million '; n %= 1000000; }
+    if (n >= 1000) { r += convertHundreds(Math.floor(n / 1000)) + 'Thousand '; n %= 1000; }
+    r += convertHundreds(n);
+    return r.trim();
+  };
+  let words = convert(pounds) + ' Pound' + (pounds !== 1 ? 's' : '');
+  if (pence > 0) words += ' and ' + convert(pence) + ' Pence';
+  return words;
+}
+async function generatePaymentCertificate(args: Args, user: AuthUser): Promise<unknown> {
+  const id = args.payment_pack_line_item_id as string | undefined;
+  if (!id) return { error: 'Missing payment_pack_line_item_id' };
+  const liR = await query<any>(`SELECT * FROM "payment_pack_line_item" WHERE id = $1 LIMIT 1`, [id]);
+  const lineItem = liR.rows[0];
+  if (!lineItem) return { error: 'Line item not found' };
+  if (lineItem.certification_status !== 'certified') return { error: 'Payment must be certified before issuing a certificate' };
+
+  const packR = await query<any>(`SELECT * FROM "payment_pack" WHERE id = $1 LIMIT 1`, [lineItem.payment_pack_id]);
+  const pack = packR.rows[0];
+  const allForPkg = await query<{ certificate_number: string | null }>(`SELECT certificate_number FROM "payment_pack_line_item" WHERE development_package_id = $1`, [lineItem.development_package_id]);
+  const certNumber = allForPkg.rows.filter((li) => li.certificate_number).length + 1;
+  const baseRef = lineItem.purchase_order_number || lineItem.package_name || 'REF';
+  const certificateNumber = `${baseRef}-C${certNumber}`;
+
+  const devR = await query<any>(`SELECT * FROM "development" WHERE id = $1 LIMIT 1`, [pack?.development_id]);
+  const development = devR.rows[0];
+  let company: any = null;
+  if (development?.company_id) { const c = await query<any>(`SELECT * FROM "company" WHERE id = $1 LIMIT 1`, [development.company_id]); company = c.rows[0]; }
+  let supplier: any = null;
+  if (lineItem.subcontractor_id) { const s = await query<any>(`SELECT * FROM "supplier" WHERE id = $1 LIMIT 1`, [lineItem.subcontractor_id]); supplier = s.rows[0]; }
+  const dpR = await query<any>(`SELECT * FROM "development_package" WHERE id = $1 LIMIT 1`, [lineItem.development_package_id]);
+  const devPackage = dpR.rows[0];
+
+  const gbp = (n: number) => `£${(Number(n) || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const dstr = (d: Date) => d.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' });
+  const today = new Date();
+  const issueDate = dstr(today);
+  const periodParts = pack?.period ? String(pack.period).split('-') : [];
+  const valuationDate = periodParts.length === 2 ? dstr(new Date(parseInt(periodParts[0], 10), parseInt(periodParts[1], 10) - 1, 1)) : issueDate;
+  const paymentDueDate = dstr(new Date(today.getTime() + 14 * 24 * 60 * 60 * 1000));
+
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  const w = 210, margin = 20; let y = 20;
+  doc.setFontSize(18); doc.setFont('helvetica', 'bold');
+  doc.text('Certificate of Payment', margin, y); y += 6;
+  doc.setDrawColor(0); doc.setLineWidth(0.5); doc.line(margin, y + 2, w - margin, y + 2); y += 10;
+  const col1 = margin, col2 = w / 2 + 5;
+  doc.setFontSize(9); doc.setFont('helvetica', 'bold');
+  doc.text('Employer:', col1, y); doc.text('Contractor:', col2, y); y += 5;
+  doc.setFont('helvetica', 'normal');
+  const employerLines = [company?.company_name || 'N/A', company?.address || ''].filter(Boolean);
+  employerLines.forEach((line) => { doc.text(String(line), col1, y); y += 4; });
+  let y2 = y - employerLines.length * 4;
+  const contractorLines = [supplier?.company_name || lineItem.subcontractor_name || 'N/A', supplier?.address || ''].filter(Boolean);
+  contractorLines.forEach((line) => { doc.text(String(line), col2, y2); y2 += 4; });
+  y = Math.max(y, y2) + 4;
+  doc.setFont('helvetica', 'bold'); doc.text('Site Address:', col1, y); doc.text('Contract Sum:', col2, y); y += 5;
+  doc.setFont('helvetica', 'normal');
+  doc.text([development?.name || 'N/A', development?.address || ''].filter(Boolean).join(', '), col1, y, { maxWidth: 85 });
+  doc.text(gbp(devPackage?.total_package_value || lineItem.total_contract_value || 0), col2, y); y += 10;
+  doc.setFont('helvetica', 'bold'); doc.text('Valuation Date:', col1, y); doc.text('Issue Date:', col2, y); y += 5;
+  doc.setFont('helvetica', 'normal'); doc.text(valuationDate, col1, y); doc.text(issueDate, col2, y); y += 10;
+  doc.setFont('helvetica', 'bold'); doc.text('Payment Certificate Number:', col1, y); doc.text('Package Reference:', col2, y); y += 5;
+  doc.setFont('helvetica', 'normal'); doc.text(certificateNumber, col1, y); doc.text(lineItem.package_name || devPackage?.description || '—', col2, y); y += 8;
+  doc.setLineWidth(0.3); doc.line(margin, y, w - margin, y); y += 8;
+  const rightAlign = w - margin;
+  const claimed = Number(lineItem.amount_claimed_this_period) || 0;
+  doc.setFont('helvetica', 'bold'); doc.text('Gross Amount Due:', margin + 10, y); doc.text(gbp(claimed), rightAlign, y, { align: 'right' }); y += 8;
+  doc.text('Less Retention:', margin + 10, y); y += 5;
+  const retentionPct = Number(lineItem.in_contract_retention_percentage) || 0;
+  const retentionAmount = claimed * (retentionPct / 100);
+  doc.setFont('helvetica', 'normal');
+  doc.text(lineItem.package_name || 'Works', margin + 20, y);
+  doc.text(`${retentionPct}%`, margin + 90, y, { align: 'right' });
+  doc.text(gbp(claimed), margin + 115, y, { align: 'right' });
+  doc.text(gbp(retentionAmount), rightAlign, y, { align: 'right' }); y += 8;
+  const netAmountDue = claimed - retentionAmount;
+  doc.setFont('helvetica', 'bold'); doc.text('Net Amount Due:', margin + 10, y); doc.text(gbp(netAmountDue), rightAlign, y, { align: 'right' }); y += 8;
+  doc.text('Amount Previously Certified:', margin + 10, y); doc.text(gbp(lineItem.previously_claimed || 0), rightAlign, y, { align: 'right' }); y += 8;
+  const paymentDue = Number(lineItem.net_total_payable) || 0;
+  doc.setLineWidth(0.5); doc.line(rightAlign - 40, y - 1, rightAlign, y - 1);
+  doc.text('Payment Due:', margin + 10, y); doc.text(gbp(paymentDue), rightAlign, y, { align: 'right' });
+  doc.line(rightAlign - 40, y + 1, rightAlign, y + 1); y += 10;
+  doc.setFont('helvetica', 'bold'); doc.text('Amount in Words:', margin + 10, y); y += 5;
+  doc.setFont('helvetica', 'italic'); doc.text(numberToWords(paymentDue), w / 2, y, { align: 'center', maxWidth: 130 }); y += 10;
+  doc.setFont('helvetica', 'bold'); doc.text('Payment Due Date:', margin + 10, y);
+  doc.setFont('helvetica', 'normal'); doc.text(paymentDueDate, rightAlign, y, { align: 'right' }); y += 8;
+  doc.setLineWidth(0.3); doc.line(margin, y, w - margin, y); y += 10;
+  doc.setFont('helvetica', 'bold'); doc.text('Certified by:', margin, y);
+  doc.setFont('helvetica', 'normal'); doc.text(`${(await query<{ full_name: string | null }>(`SELECT full_name FROM "user" WHERE lower(email)=lower($1) LIMIT 1`, [user.email ?? ''])).rows[0]?.full_name || user.email || ''}`, margin + 35, y); y += 6;
+  doc.setFont('helvetica', 'bold'); doc.text('Date:', margin, y);
+  doc.setFont('helvetica', 'normal'); doc.text(issueDate, margin + 35, y); y += 10;
+  doc.line(margin, y, w - margin, y); y += 6;
+  doc.setFontSize(8); doc.setFont('helvetica', 'bold'); doc.text('Notes:', margin, y); y += 4;
+  doc.setFont('helvetica', 'normal'); doc.setTextColor(180, 0, 0); doc.text('The above amount is exclusive of VAT', margin, y); doc.setTextColor(0, 0, 0); y += 8;
+  doc.setLineWidth(0.5); doc.line(margin, y, w - margin, y);
+
+  const pdfBase64 = doc.output('datauristring');
+  return { certificate_number: certificateNumber, pdf_base64: pdfBase64 };
+}
+
+// importStarshipEmployees — admin: seed Starship Modular's historical employee roster
+// (embedded remuneration + contact data). dry_run returns a preview without writing.
+const STARSHIP_COMPANY_ID = '699edc638cdf5ab1302aa87a';
+const STARSHIP_COMPANY_NAME = 'Starship Modular Limited';
+const STARSHIP_CONTACT: Record<string, { dob: string; address: string; email: string }> = {
+  '1': { dob: '2002-06-02', address: '18 Sunningdale Close LIVERPOOL Liverpool L36 4QF', email: 'alexbruce2@icloud.com' },
+  '22': { dob: '1996-09-10', address: '27 Drake Road Moreton Wirral CH46 2QS', email: 'apitty1996@gmail.com' },
+  '25': { dob: '2002-10-07', address: '3 St. Pauls Avenue Wallasey CH44 7BB', email: 'brogenpimblett2@gmail.com' },
+  '34': { dob: '1994-05-18', address: '14 St. Edwards Close Birkenhead CH41 8FN', email: 'chrissy_6@gmail.com' },
+  '16': { dob: '1996-12-08', address: '19 Greenwood Lane Wallasey CH44 1DD', email: 'conorcarr96@googlemail.com' },
+  '6': { dob: '1979-03-01', address: '4 St. Peters Close SAINT HELENS St. Helens WA9 2ET', email: 'davidjrushton@btinternet.com' },
+  '3': { dob: '2001-10-15', address: '40 Coral Avenue LIVERPOOL Liverpool L36 2PZ', email: 'dylwatson2001@gmail.com' },
+  '52': { dob: '1984-03-07', address: 'Hillside Gateacre Brow Liverpool L25 3PB', email: 'emilybrady84@icloud.com' },
+  '55': { dob: '1970-03-22', address: '18 Tenby Drive Wirral CH46 0QA', email: 'tyrer311@yahoo.co.uk' },
+  '20': { dob: '2002-08-05', address: '11 Whitelodge Avenue Liverpool L36 2PT', email: 'jakedonoghue41@gmail.com' },
+  '8': { dob: '1989-08-16', address: '22 Greenlake Road LIVERPOOL Liverpool L18 7JA', email: 'jamesmaher89@hotmail.co.uk' },
+  '7': { dob: '1981-09-04', address: '4 Fender Court WIRRAL Wirral CH49 5LH', email: 'j4m1e.mckibbin@gmail.com' },
+  '41': { dob: '1999-03-10', address: '5 Orchard Court Birkenhead CH41 9HD', email: 'jamiesimon226@gmail.com' },
+  '15': { dob: '2001-05-25', address: '22 Thorpe Bank Birkenhead CH42 4NP', email: 'joe.doran2@outlook.com' },
+  '11': { dob: '1983-08-21', address: '1 Merebank Oxton CH43 9WX', email: 'karlventre@starshipgroup.co.uk' },
+  '31': { dob: '1965-01-15', address: 'Anchorage Ditton Lane Wirral CH46 3SB', email: 'keithwitheyone@gmail.com' },
+  '12': { dob: '1972-04-17', address: 'Mead Cottage Street Hey Lane Neston CH64 1SS', email: 'kevin.hardy5@yahoo.co.uk' },
+  '42': { dob: '1994-06-23', address: '29A Holt Road Birkenhead CH41 9EN', email: 'kylemcminnlfc@gmail.com' },
+  '47': { dob: '1985-10-08', address: '2 Dunster Grove Wirral CH60 3SA', email: 'leebarlow72@gmail.com' },
+  '30': { dob: '1972-03-30', address: '37 Rudd Street Wirral CH47 2DX', email: 'lee.gerrard@hotmail.co.uk' },
+  '40': { dob: '1997-01-13', address: '18 Bidston Green Drive Prenton CH43 7YP', email: 'liam.christopher.barnes@gmail.com' },
+  '53': { dob: '1999-09-13', address: '70 Whitford Road Birkenhead CH42 7JA', email: 'louislea13@hotmail.com' },
+  '56': { dob: '1995-06-03', address: '80 Boundary Road Prenton CH43 7PQ', email: 'luke.saunders32@icloud.com' },
+  '4': { dob: '1951-03-20', address: '7 Hyacinth Grove WIRRAL Wirral CH46 1SW', email: 'michael.ventre@sky.com' },
+  '54': { dob: '1998-06-06', address: '12 St. Ambrose Road Widnes WA8 0AJ', email: 'reecehickey98@yahoo.com' },
+  '28': { dob: '1970-08-16', address: '65 Dombey Street Liverpool L8 5TJ', email: 'Robbiewvmyers16@gmail.com' },
+  '35': { dob: '1993-05-06', address: '10 Magazine Walk Magazine Road Wirral CH62 3LJ', email: 'r.jmw@outlook.com' },
+  '50': { dob: '1969-02-20', address: '41 Larch Road Birkenhead CH42 0JG', email: 'tezmcloughlin655@gmail.com' },
+  '38': { dob: '1992-07-11', address: '15 Crofton Road Birkenhead CH42 5NS', email: 'tommcnamara92@icloud.com' },
+};
+const STARSHIP_REMUNERATION: { emp_no: string; first_name: string; last_name: string; start_date: string; termination_date: string | null; pay_freq: string }[] = [
+  { emp_no: '2', first_name: 'Andrew', last_name: 'Williams', start_date: '2021-02-07', termination_date: '2021-05-16', pay_freq: 'Weekly' },
+  { emp_no: '1', first_name: 'Alex', last_name: 'Bruce', start_date: '2021-02-07', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '3', first_name: 'Dylan', last_name: 'Watson', start_date: '2021-02-07', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '4', first_name: 'Michael', last_name: 'Ventre', start_date: '2021-02-07', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '5', first_name: 'Robert', last_name: 'Lewis', start_date: '2021-04-15', termination_date: '2021-08-13', pay_freq: 'Weekly' },
+  { emp_no: '6', first_name: 'David', last_name: 'Rushton', start_date: '2021-08-09', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '7', first_name: 'Jamie', last_name: 'McKibbin', start_date: '2021-08-16', termination_date: null, pay_freq: 'Monthly' },
+  { emp_no: '9', first_name: 'Luke', last_name: 'Rushton', start_date: '2021-10-20', termination_date: '2023-03-31', pay_freq: 'Weekly' },
+  { emp_no: '11', first_name: 'Karl', last_name: 'Ventre', start_date: '2022-01-01', termination_date: null, pay_freq: 'Monthly' },
+  { emp_no: '12', first_name: 'Kevin', last_name: 'Hardy', start_date: '2022-01-17', termination_date: null, pay_freq: 'Monthly' },
+  { emp_no: '13', first_name: 'Michael', last_name: 'McNally', start_date: '2022-01-31', termination_date: '2023-05-31', pay_freq: 'Monthly' },
+  { emp_no: '14', first_name: 'Mark', last_name: 'Nicholson', start_date: '2022-01-31', termination_date: '2022-02-08', pay_freq: 'Weekly' },
+  { emp_no: '15', first_name: 'Joseph', last_name: 'Doran', start_date: '2022-02-14', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '16', first_name: 'Conor', last_name: 'Carr', start_date: '2022-02-14', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '17', first_name: 'Abigale', last_name: 'Thomas', start_date: '2022-03-14', termination_date: '2022-05-03', pay_freq: 'Monthly' },
+  { emp_no: '18', first_name: 'James', last_name: 'Baskeyfield', start_date: '2022-03-14', termination_date: '2022-07-01', pay_freq: 'Weekly' },
+  { emp_no: '19', first_name: 'Luke', last_name: 'Stappleton', start_date: '2022-03-14', termination_date: '2022-04-08', pay_freq: 'Weekly' },
+  { emp_no: '20', first_name: 'Jacob', last_name: 'Donoghue', start_date: '2022-04-25', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '21', first_name: 'Laurence', last_name: 'Harris', start_date: '2022-05-15', termination_date: '2022-07-22', pay_freq: 'Weekly' },
+  { emp_no: '22', first_name: 'Alex', last_name: 'Pitt', start_date: '2022-05-23', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '23', first_name: 'Lee', last_name: 'Jacques', start_date: '2022-07-05', termination_date: '2022-11-25', pay_freq: 'Weekly' },
+  { emp_no: '24', first_name: 'Louis', last_name: 'Keegan', start_date: '2022-07-13', termination_date: '2022-07-22', pay_freq: 'Weekly' },
+  { emp_no: '25', first_name: 'Brogen', last_name: 'Pimblett', start_date: '2022-08-01', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '26', first_name: 'Patrick', last_name: 'Brennan', start_date: '2022-09-26', termination_date: '2023-07-25', pay_freq: 'Weekly' },
+  { emp_no: '27', first_name: 'Jack', last_name: "O'Brien", start_date: '2022-10-17', termination_date: '2023-02-07', pay_freq: 'Weekly' },
+  { emp_no: '28', first_name: 'Robert', last_name: 'Myers', start_date: '2022-10-17', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '29', first_name: 'Thomas', last_name: 'Atherton', start_date: '2022-10-17', termination_date: '2023-03-10', pay_freq: 'Weekly' },
+  { emp_no: '30', first_name: 'Lee', last_name: 'Gerrard', start_date: '2022-10-24', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '31', first_name: 'Keith', last_name: 'Withey', start_date: '2022-10-24', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '32', first_name: 'Sean', last_name: 'Stephens', start_date: '2022-10-24', termination_date: '2022-10-28', pay_freq: 'Weekly' },
+  { emp_no: '33', first_name: 'Keiran', last_name: 'Griffiths', start_date: '2022-10-24', termination_date: '2023-03-13', pay_freq: 'Weekly' },
+  { emp_no: '34', first_name: 'Christopher', last_name: 'Lawler', start_date: '2022-11-07', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '35', first_name: 'Robert', last_name: 'Wardle', start_date: '2022-10-31', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '36', first_name: 'Scott', last_name: 'Carty', start_date: '2022-10-31', termination_date: '2023-01-19', pay_freq: 'Weekly' },
+  { emp_no: '37', first_name: 'Christopher', last_name: 'Charlton', start_date: '2022-11-07', termination_date: '2022-11-23', pay_freq: 'Weekly' },
+  { emp_no: '8', first_name: 'James', last_name: 'Maher', start_date: '2022-11-01', termination_date: null, pay_freq: 'Monthly' },
+  { emp_no: '38', first_name: 'Thomas', last_name: 'McNamara', start_date: '2022-11-21', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '39', first_name: 'David', last_name: 'Forbes', start_date: '2022-12-01', termination_date: '2023-04-14', pay_freq: 'Weekly' },
+  { emp_no: '40', first_name: 'Liam', last_name: 'Barnes', start_date: '2023-01-03', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '41', first_name: 'Jamie', last_name: 'Simon-Griffiths', start_date: '2023-01-03', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '42', first_name: 'Kyle', last_name: 'McMinn', start_date: '2023-01-03', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '44', first_name: 'Christopher', last_name: 'Richards', start_date: '2022-12-30', termination_date: '2023-07-31', pay_freq: 'Monthly' },
+  { emp_no: '45', first_name: 'Karl', last_name: 'Dugdale', start_date: '2023-01-19', termination_date: '2023-03-10', pay_freq: 'Weekly' },
+  { emp_no: '46', first_name: 'Amanda', last_name: 'Ashton', start_date: '2023-01-30', termination_date: '2023-03-27', pay_freq: 'Monthly' },
+  { emp_no: '47', first_name: 'Lee', last_name: 'Barlow', start_date: '2023-05-01', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '48', first_name: 'George', last_name: 'Cullen', start_date: '2023-05-01', termination_date: '2023-08-11', pay_freq: 'Weekly' },
+  { emp_no: '49', first_name: 'Alfie', last_name: 'McNamara', start_date: '2023-05-30', termination_date: '2023-06-01', pay_freq: 'Weekly' },
+  { emp_no: '50', first_name: 'Terence', last_name: 'McLoughlin', start_date: '2023-05-30', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '51', first_name: 'Christopher', last_name: 'McNamara', start_date: '2023-05-30', termination_date: '2023-06-23', pay_freq: 'Weekly' },
+  { emp_no: '52', first_name: 'Emily', last_name: 'Brady', start_date: '2023-06-19', termination_date: null, pay_freq: 'Monthly' },
+  { emp_no: '53', first_name: 'Louis', last_name: 'Lea', start_date: '2023-06-13', termination_date: null, pay_freq: 'Monthly' },
+  { emp_no: '54', first_name: 'Reece', last_name: 'Hickey', start_date: '2023-06-19', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '55', first_name: 'Ian', last_name: 'Tyrer', start_date: '2023-07-10', termination_date: null, pay_freq: 'Weekly' },
+  { emp_no: '56', first_name: 'Luke', last_name: 'Saunders', start_date: '2023-08-29', termination_date: null, pay_freq: 'Weekly' },
+];
+async function importStarshipEmployees(args: Args, user: AuthUser): Promise<unknown> {
+  if (user.role !== 'admin') return { error: 'Admin only' };
+  const dryRun = args.dry_run === true;
+  const results: { created: number; skipped: number; errors: string[]; preview: Record<string, unknown>[] } = { created: 0, skipped: 0, errors: [], preview: [] };
+  const existing = await query<{ employee_no: string | null }>(`SELECT employee_no FROM "employee"`);
+  const existingNos = new Set(existing.rows.map((e) => e.employee_no));
+  for (const emp of STARSHIP_REMUNERATION) {
+    const empNo = emp.emp_no.trim();
+    if (existingNos.has(empNo)) { results.skipped++; continue; }
+    const contact = STARSHIP_CONTACT[empNo] || ({} as any);
+    const isLeaver = !!emp.termination_date;
+    const record = {
+      employee_no: empNo, first_name: emp.first_name.trim(), last_name: emp.last_name.trim(),
+      employment_start_date: emp.start_date, pay_cycle: emp.pay_freq === 'Weekly' ? 'Weekly' : 'Monthly',
+      company_id: STARSHIP_COMPANY_ID, company_name: STARSHIP_COMPANY_NAME, status: isLeaver ? 'leaver' : 'active',
+      dob: contact.dob || null, home_address: contact.address || null, email: contact.email || null,
+    };
+    results.preview.push(record);
+    if (!dryRun) { await insertRow('employee', record, user); results.created++; }
+  }
+  return { ...results, dry_run: dryRun };
+}
+
 const handlers: Record<string, Handler> = {
   processInvoice: (args) => processInvoice(args),
   getAppConfig: () => getAppConfig(),
@@ -1241,6 +1502,9 @@ const handlers: Record<string, Handler> = {
   deleteUserAccount: (args, user) => deleteUserAccount(args, user),
   checkUserSuspension: (args, user) => checkUserSuspension(args, user),
   analyseProgrammeChange: (args) => analyseProgrammeChange(args),
+  generateTimesheetExcel: (args) => generateTimesheetExcel(args),
+  generatePaymentCertificate: (args, user) => generatePaymentCertificate(args, user),
+  importStarshipEmployees: (args, user) => importStarshipEmployees(args, user),
 };
 
 export async function functionRoutes(app: FastifyInstance): Promise<void> {

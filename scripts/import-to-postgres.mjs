@@ -31,6 +31,10 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
+// 'insert' (first load, ON CONFLICT DO NOTHING) or 'upsert' (refresh, updates changed rows).
+const MODE = (process.env.IMPORT_MODE || 'insert').toLowerCase();
+console.log(`Import mode: ${MODE}`);
+
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NO_SSL ? false : { rejectUnauthorized: false },
@@ -83,6 +87,7 @@ async function importTable(entity, table) {
 
   const rows = JSON.parse(fs.readFileSync(file, 'utf8'));
   let inserted = 0;
+  let updated = 0;
   let conflicted = 0;
   const errors = [];
 
@@ -97,11 +102,20 @@ async function importTable(entity, table) {
       const values = keys.map((k) => coerce(row[k], cols.get(k)));
       const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
       const collist = keys.map((k) => `"${k}"`).join(', ');
-      const sql = `INSERT INTO "${table}" (${collist}) VALUES (${placeholders}) ON CONFLICT (id) DO NOTHING`;
+      // MODE=upsert (data refresh): update existing rows so Base44 edits flow through.
+      // Default (first load): DO NOTHING, so re-runs are cheap and non-destructive.
+      const updateCols = keys.filter((k) => k !== 'id');
+      const conflictClause = MODE === 'upsert' && updateCols.length
+        ? `ON CONFLICT (id) DO UPDATE SET ${updateCols.map((k) => `"${k}" = EXCLUDED."${k}"`).join(', ')}`
+        : 'ON CONFLICT (id) DO NOTHING';
+      // xmax = 0 on a genuine INSERT; non-zero when the row was UPDATEd via the conflict.
+      const sql = `INSERT INTO "${table}" (${collist}) VALUES (${placeholders}) ${conflictClause} RETURNING (xmax = 0) AS _inserted`;
       try {
         const res = await client.query(sql, values);
-        if (res.rowCount === 1) inserted++;
-        else conflicted++;
+        if (res.rowCount === 1) {
+          if (res.rows[0]?._inserted) inserted++;
+          else updated++;
+        } else conflicted++;
       } catch (e) {
         if (errors.length < 5) errors.push(e.message);
       }
@@ -110,9 +124,9 @@ async function importTable(entity, table) {
     client.release();
   }
 
-  const line = `${table.padEnd(34)} +${inserted}${conflicted ? ` (${conflicted} existing)` : ''}${errors.length ? `  ERRORS: ${errors.length}` : ''}`;
+  const line = `${table.padEnd(34)} +${inserted}${updated ? ` ~${updated}` : ''}${conflicted ? ` (${conflicted} unchanged)` : ''}${errors.length ? `  ERRORS: ${errors.length}` : ''}`;
   console.log(line);
-  return { table, inserted, conflicted, errors: errors.slice(0, 5), sourceRows: rows.length };
+  return { table, inserted, updated, conflicted, errors: errors.slice(0, 5), sourceRows: rows.length };
 }
 
 const entities = JSON.parse(fs.readFileSync(ENTITIES, 'utf8'));
@@ -128,6 +142,7 @@ for (const { entity, table } of entities) {
 
 fs.writeFileSync(path.join(DATA, '_import-manifest.json'), JSON.stringify(report, null, 2));
 const totalInserted = report.reduce((n, r) => n + (r.inserted || 0), 0);
+const totalUpdated = report.reduce((n, r) => n + (r.updated || 0), 0);
 const withErrors = report.filter((r) => (r.errors && r.errors.length) || r.error).length;
-console.log(`\nImport complete. ${totalInserted} rows inserted across ${report.length} tables${withErrors ? `, ${withErrors} tables had errors` : ''}.`);
+console.log(`\nImport complete (${MODE}). ${totalInserted} inserted${MODE === 'upsert' ? `, ${totalUpdated} updated` : ''} across ${report.length} tables${withErrors ? `, ${withErrors} tables had errors` : ''}.`);
 await pool.end();

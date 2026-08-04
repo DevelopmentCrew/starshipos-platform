@@ -92,3 +92,9 @@ variable "api_desired_count" {
   type        = number
   default     = 2
 }
+
+variable "mirror_schedule" {
+  description = "How often the Base44 -> RDS data mirror runs (EventBridge schedule expression). Dial back to e.g. rate(4 hours) if Base44's API rate-limits."
+  type        = string
+  default     = "rate(1 hour)"
+}

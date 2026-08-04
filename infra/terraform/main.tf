@@ -70,3 +70,13 @@ module "api" {
   api_domain         = var.api_domain
   root_domain        = var.root_domain
 }
+
+module "mirror" {
+  source              = "./modules/mirror"
+  name                = local.name
+  cluster_name        = module.api.cluster_name
+  private_subnet_ids  = module.network.private_subnet_ids
+  security_group_id   = module.api.service_security_group_id
+  db_secret_arn       = module.database.db_secret_arn
+  schedule_expression = var.mirror_schedule
+}

@@ -1,0 +1,96 @@
+name: mirror-deploy
+
+# Builds the data-mirror image and registers a new task-definition revision.
+# The hourly EventBridge schedule (from Terraform) always runs the latest revision,
+# so there's no service to update — registering the task def is the whole deploy.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/mirror-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-2
+
+jobs:
+  build-and-register:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, push, and register the mirror task definition
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          NAME: starshipos-${{ github.event.inputs.environment || 'dev' }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$NAME-mirror:$IMAGE_TAG"
+          docker build -f scripts/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE" || echo "image tag $IMAGE_TAG already in ECR, reusing it"
+
+          DB_SECRET=$(aws secretsmanager describe-secret --secret-id "$NAME/db-credentials" --query ARN --output text)
+          B44_SECRET=$(aws secretsmanager describe-secret --secret-id "$NAME/base44-token" --query ARN --output text)
+          EXEC_ARN=$(aws iam get-role --role-name "$NAME-mirror-exec" --query 'Role.Arn' --output text)
+          TASK_ARN=$(aws iam get-role --role-name "$NAME-mirror-task" --query 'Role.Arn' --output text)
+          LOG_GROUP="/ecs/$NAME-mirror"
+
+          NEW=$(jq -n \
+            --arg FAMILY "$NAME-mirror" --arg IMG "$IMAGE" --arg EXEC "$EXEC_ARN" --arg TASK "$TASK_ARN" \
+            --arg DB "$DB_SECRET" --arg B44 "$B44_SECRET" --arg LG "$LOG_GROUP" --arg REGION "$AWS_REGION" '
+            {
+              family: $FAMILY,
+              requiresCompatibilities: ["FARGATE"],
+              networkMode: "awsvpc",
+              cpu: "512", memory: "1024",
+              executionRoleArn: $EXEC,
+              taskRoleArn: $TASK,
+              containerDefinitions: [{
+                name: "mirror",
+                image: $IMG,
+                essential: true,
+                environment: [
+                  {name:"BASE44_APP_ID", value:"698dd71bea4336a2150f8d15"},
+                  {name:"IMPORT_MODE", value:"replace"},
+                  {name:"AWS_REGION", value:$REGION}
+                ],
+                secrets: [
+                  {name:"DB_HOST",     valueFrom:($DB+":host::")},
+                  {name:"DB_PORT",     valueFrom:($DB+":port::")},
+                  {name:"DB_USER",     valueFrom:($DB+":username::")},
+                  {name:"DB_PASSWORD", valueFrom:($DB+":password::")},
+                  {name:"DB_NAME",     valueFrom:($DB+":dbname::")},
+                  {name:"BASE44_TOKEN",valueFrom:($B44+":token::")}
+                ],
+                logConfiguration: {
+                  logDriver: "awslogs",
+                  options: {"awslogs-group":$LG, "awslogs-region":$REGION, "awslogs-stream-prefix":"mirror"}
+                }
+              }]
+            }')
+          echo "$NEW" > taskdef.json
+          aws ecs register-task-definition --cli-input-json file://taskdef.json --query 'taskDefinition.taskDefinitionArn' --output text
+          echo "Registered $NAME-mirror with image $IMAGE"

@@ -37,6 +37,10 @@ PY
 echo "Target DB: $(python3 -c "import json,sys;s=json.loads(sys.argv[1]);print(s['host'],s['dbname'])" "$SECRET")"
 
 echo; echo "== 1/3  Export current data from Base44 =="
+# IMPORTANT: clear any previous export first. export-base44.mjs skips tables whose
+# file already exists (resume support), so a stale data-export/ from an earlier run
+# would silently re-import OLD data and the refresh would be a no-op.
+rm -rf data-export
 node scripts/export-base44.mjs
 
 echo; echo "== 2/3  Upsert into RDS (add new + update changed) =="

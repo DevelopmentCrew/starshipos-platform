@@ -32,9 +32,13 @@ if (!APP_ID || (!TOKEN && !(EMAIL && PASSWORD))) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const base44 = createClient({ appId: APP_ID });
+// IMPORTANT: pass the token at CREATION. The entities client locks its Authorization
+// header when the client is built; calling auth.setToken() afterwards only updates the
+// global axios + functions client, so entity .list() calls would go out unauthenticated
+// (Base44 then returns 403 "app is private / auth_required").
+const base44 = createClient(TOKEN ? { appId: APP_ID, token: TOKEN } : { appId: APP_ID });
 try {
-  if (TOKEN) { base44.auth.setToken(TOKEN, false); console.log('Authenticating with BASE44_TOKEN.'); }
+  if (TOKEN) { console.log('Authenticating with BASE44_TOKEN (set at client creation).'); }
   else { await base44.auth.loginViaEmailPassword(EMAIL, PASSWORD); console.log('Authenticated via email/password.'); }
 } catch (err) {
   console.error('Base44 auth failed:', err?.response?.data?.message || err.message);

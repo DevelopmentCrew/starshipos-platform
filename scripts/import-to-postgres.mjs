@@ -31,9 +31,22 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-// 'insert' (first load, ON CONFLICT DO NOTHING) or 'upsert' (refresh, updates changed rows).
+// 'insert' (first load, ON CONFLICT DO NOTHING), 'upsert' (refresh, updates changed
+// rows), or 'replace' (mirror: TRUNCATE each table then reload — makes Postgres an
+// exact copy of Base44, so any records created only in the AWS test app are removed).
 const MODE = (process.env.IMPORT_MODE || 'insert').toLowerCase();
 console.log(`Import mode: ${MODE}`);
+
+// SAFETY (replace mode): never TRUNCATE a table whose Base44 export failed — that would
+// wipe good data with nothing to reload. Skip any table the export manifest marks failed.
+let failedExports = new Set();
+if (MODE === 'replace') {
+  try {
+    const man = JSON.parse(fs.readFileSync(path.join(DATA, '_manifest.json'), 'utf8'));
+    failedExports = new Set(man.filter((m) => m.error || typeof m.count !== 'number').map((m) => m.table));
+    if (failedExports.size) console.log(`replace mode: ${failedExports.size} table(s) had export errors — those will be preserved, not truncated.`);
+  } catch { /* no manifest — the per-table existence check still guards */ }
+}
 
 const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
@@ -85,6 +98,12 @@ async function importTable(entity, table) {
   const cols = await columnsFor(table);
   if (cols.size === 0) return { table, skipped: 'table not in schema' };
 
+  // replace mode: skip tables whose export failed (don't wipe good data with nothing to load).
+  if (MODE === 'replace' && failedExports.has(table)) {
+    console.log(`${table.padEnd(34)} SKIP (export failed — existing rows preserved)`);
+    return { table, skipped: 'export failed, preserved' };
+  }
+
   const rows = JSON.parse(fs.readFileSync(file, 'utf8'));
   let inserted = 0;
   let updated = 0;
@@ -93,6 +112,8 @@ async function importTable(entity, table) {
 
   const client = await pool.connect();
   try {
+    // replace mode: empty the table first so Postgres ends up an exact copy of Base44.
+    if (MODE === 'replace') await client.query(`TRUNCATE TABLE "${table}"`);
     for (const row of rows) {
       const keys = Object.keys(row).filter((k) => cols.has(k));
       if (!keys.includes('id')) {
